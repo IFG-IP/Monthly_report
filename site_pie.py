@@ -451,16 +451,67 @@ def test_classification():
         print(f"  {code} → {category}")
 
 
-def main() -> int:
-    # ここは .xlsx を直接指定（CSVではありません）
-    target = Path("results") / "6月_再受付_その他.xlsx"  # 6月初回受付その他ファイルに戻す
-    print(f"🎯 処理対象ファイル: {target}")
-    print(f"📁 ファイル存在確認: {target.exists()}")
-    
-    # タイトルは任意で差し替え可
-    result = add_reception_pivot_pie(target, chart_title="サイト分類別割合")
-    print(f"🏁 処理完了: 終了コード {result}")
+def _find_latest_month_outputs(results_dir: Path) -> list[Path]:
+    """
+    results配下から latest 月の4ファイル（初回/再受付 × hp/その他）を検出して返す
+    ファイル名例: "6月_再受付_hp.xlsx", "6月_初回受付_その他.xlsx"
+    """
+    import re
+    candidates = []
+    for p in results_dir.glob("*.xlsx"):
+        m = re.match(r"(\d+)月_(再受付|初回受付)_(hp|その他)\.xlsx", p.name)
+        if m:
+            month = int(m.group(1))
+            candidates.append((month, p))
+    if not candidates:
+        return []
+    latest_month = max(m for m, _ in candidates)
+    return [p for m, p in candidates if m == latest_month]
+
+# 追加: 直近2か月分の「その他」だけを検出
+
+def _find_last_two_months_others(results_dir: Path) -> list[Path]:
+    """
+    results配下から直近2か月分の「初回/再受付 × その他」の計最大4ファイルを返す。
+    例: 7月_再受付_その他.xlsx, 7月_初回受付_その他.xlsx, 6月_再受付_その他.xlsx, 6月_初回受付_その他.xlsx
+    """
+    import re
+    by_month: dict[int, list[Path]] = {}
+    for p in results_dir.glob("*.xlsx"):
+        m = re.match(r"(\d+)月_(再受付|初回受付)_その他\.xlsx", p.name)
+        if m:
+            month = int(m.group(1))
+            by_month.setdefault(month, []).append(p)
+    if not by_month:
+        return []
+    months = sorted(by_month.keys(), reverse=True)[:2]
+    result: list[Path] = []
+    for m in months:
+        # 初回/再受付の2種があれば両方、片方だけでも追加
+        # 安定順で: 再受付→初回受付
+        files = sorted(by_month[m], key=lambda p: ("初回受付" in p.name, p.name))
+        result.extend(files)
     return result
+
+
+def main() -> int:
+    # results配下の直近2か月分の「その他」4ファイルを自動検出して一括処理
+    results_dir = Path("results")
+    targets = _find_last_two_months_others(results_dir)
+    if not targets:
+        print("❌ 対象ファイルが見つかりません（results/内の 'X月_再受付/初回受付_その他.xlsx' を確認）")
+        return 1
+    print("🎯 処理対象ファイル:")
+    for t in targets:
+        print(f" - {t}")
+    # タイトルは任意で差し替え可
+    any_error = False
+    for t in targets:
+        code = add_reception_pivot_pie(t, chart_title="サイト分類別割合")
+        if code != 0:
+            any_error = True
+    print("🏁 処理完了")
+    return 1 if any_error else 0
 
 
 if __name__ == "__main__":
