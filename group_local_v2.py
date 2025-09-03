@@ -4,25 +4,11 @@ from google.cloud import bigquery_storage
 import pandas as pd
 from datetime import datetime, timedelta
 
-# ✅ 認証情報の設定
-# Google Cloud認証情報ファイルのパスを設定
-# 注意: account-key.jsonファイルが存在する必要があります
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "account-key.json"
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "epark-refre-users-3065b61e43eb.json"
+# ✅ ワーニング対策（quota project を指定）
+os.environ["GOOGLE_CLOUD_PROJECT"] = "account-key.json"
 
-# 認証情報なしでクライアントを作成（ユーザー認証を使用）
-try:
-    client = bigquery.Client(project="epark-refre-users")
-    bqstorage_client = bigquery_storage.BigQueryReadClient()
-    print("✅ BigQueryクライアントが正常に初期化されました")
-except Exception as e:
-    print(f"❌ BigQueryクライアントの初期化に失敗しました: {e}")
-    print("\n🔧 解決方法:")
-    print("1. Google Cloud CLIをインストールして認証する")
-    print("   gcloud auth application-default login")
-    print("2. または、サービスアカウントキーファイル（JSON）を使用する")
-    print("   os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = ''")
-    exit(1)
+client = bigquery.Client(project="epark-refre-users")
+bqstorage_client = bigquery_storage.BigQueryReadClient()
 
 # 特定の物件番号を指定
 property_numbers = ["E10331191000001", "E10331193000001","E10331194000001","E10331197000001","E10331198000001","E10331200000001","E10331201000001","E10337069000001","E10337070000001"]  # ここに物件番号を設定してください
@@ -41,7 +27,11 @@ one_year_ago = last_month_start - timedelta(days=365)
 start_date = one_year_ago.strftime("%Y-%m-%d")
 end_date = last_month_end.strftime("%Y-%m-%d")
 
+# テーブル名用の日付（現在の日付）
+table_date = current_date.strftime("%Y%m%d")
+
 print(f"データ取得期間: {start_date} から {end_date} まで")
+print(f"使用テーブル日付: {table_date}")
 
 # BigQueryクエリを定義
 query = f"""
@@ -49,7 +39,7 @@ WITH w_web AS (
     SELECT 
         concat(s.shopowner_id,"_",r.time_appoint_id) as petano_log_no,
         f.facility_id, --施設ID
-        f.property_number, --物件番号'
+        f.property_number, --物件番号
         r.shopowner_no, --契約者番号
         s.shopowner_id, --契約者ID
         CASE
@@ -72,14 +62,14 @@ WITH w_web AS (
             DATETIME(PARSE_TIMESTAMP('%Y%m%d%H%M', r.APPOINT_START_DATETIME))
         ) AS appoint_datetime_clean,
         substr(r.create_date,0,10) AS create_date --予約登録日
-    FROM `epark-refre-rook.rook.T_MR_T_TIME_APPOINT_20250808` r
-    LEFT JOIN `epark-refre-rook.common.T_AD_M_SHOPOWNER_20250808` s 
+    FROM `epark-refre-rook.rook.T_MR_T_TIME_APPOINT_{table_date}` r
+    LEFT JOIN `epark-refre-rook.common.T_AD_M_SHOPOWNER_{table_date}` s 
         ON s.shopowner_no = r.shopowner_no
-    LEFT JOIN `epark-refre-rook.rook.T_MR_M_TIME_APPOINT_MENU_20250808` m 
+    LEFT JOIN `epark-refre-rook.rook.T_MR_M_TIME_APPOINT_MENU_{table_date}` m 
         ON m.shopowner_no = r.shopowner_no AND m.MENU_ID = r.MENU_ID
-    LEFT JOIN `epark-refre-rook.rook.T_MR_M_TIME_APPOINT_STAFF_20250808` ss 
+    LEFT JOIN `epark-refre-rook.rook.T_MR_M_TIME_APPOINT_STAFF_{table_date}` ss 
         ON ss.STAFF_ID = r.STAFF_ID AND ss.SHOPOWNER_NO = r.SHOPOWNER_NO
-    LEFT JOIN `epark-refre-users.public.T_BI_M_FACILITY_20250808` f
+    LEFT JOIN `epark-refre-users.public.T_BI_M_FACILITY_{table_date}` f
         ON f.RESERVE_SHOPOWNER_ID = s.SHOPOWNER_ID
     WHERE r.inside_outside_flg = "2" --WEB予約のみ
         AND r.SYSTEM_USAGE_KIND != "0" --WEB予約のみ※念の為
@@ -100,7 +90,7 @@ try:
     
     # 結果を保存
     base_date = datetime.today().replace(day=1)
-    output_dir = "results"  # 現在のディレクトリにresultsフォルダを作成
+    output_dir = "C:/Users/8961083/.cursor/workspace_petlife/results"
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"web_reservation_leaf_{base_date.strftime('%Y%m%d')}.csv")
     

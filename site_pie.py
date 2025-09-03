@@ -1,4 +1,6 @@
 from pathlib import Path
+import sys
+from datetime import datetime, timedelta
 
 
 def get_site_code_classification():
@@ -451,75 +453,325 @@ def test_classification():
         print(f"  {code} → {category}")
 
 
-def _find_latest_month_outputs(results_dir: Path) -> list[Path]:
-    """
-    results配下から latest 月の4ファイル（初回/再受付 × hp/その他）を検出して返す
-    ファイル名例: "6月_再受付_hp.xlsx", "6月_初回受付_その他.xlsx"
-    """
-    import re
-    candidates = []
-    for p in results_dir.glob("*.xlsx"):
-        m = re.match(r"(\d+)月_(再受付|初回受付)_(hp|その他)\.xlsx", p.name)
-        if m:
-            month = int(m.group(1))
-            candidates.append((month, p))
-    if not candidates:
-        return []
-    latest_month = max(m for m, _ in candidates)
-    return [p for m, p in candidates if m == latest_month]
+def show_help():
+    """使用方法を表示"""
+    print("""
+📊 サイト分類別円グラフ作成ツール
 
-# 追加: 直近2か月分の「その他」だけを検出
+使用方法:
+  python site_pie.py                                    # 過去2か月のデータを自動処理
+  python site_pie.py ファイル名.xlsx                     # 特定のファイルを処理
+  python site_pie.py --months 2024-08,2024-09           # 特定の2か月を指定して処理
+  python site_pie.py --all                              # resultsディレクトリ内の全ファイルを処理
+  python site_pie.py --test                             # サイトコード分類テストを実行
+  python site_pie.py --help                             # このヘルプを表示
 
-def _find_last_two_months_others(results_dir: Path) -> list[Path]:
-    """
-    results配下から直近2か月分の「初回/再受付 × その他」の計最大4ファイルを返す。
-    例: 7月_再受付_その他.xlsx, 7月_初回受付_その他.xlsx, 6月_再受付_その他.xlsx, 6月_初回受付_その他.xlsx
-    """
-    import re
-    by_month: dict[int, list[Path]] = {}
-    for p in results_dir.glob("*.xlsx"):
-        m = re.match(r"(\d+)月_(再受付|初回受付)_その他\.xlsx", p.name)
-        if m:
-            month = int(m.group(1))
-            by_month.setdefault(month, []).append(p)
-    if not by_month:
+例:
+  python site_pie.py                                    # 過去2か月を自動処理（推奨）
+  python site_pie.py 7月_初回受付_その他.xlsx
+  python site_pie.py "6月_再受付_hp.xlsx"
+  python site_pie.py results/7月_初回受付_hp.xlsx
+  python site_pie.py --months 2024-08,2024-09          # 8月と9月のデータを処理
+  python site_pie.py --all                              # 全ファイルを処理
+
+月指定の形式:
+  --months YYYY-MM,YYYY-MM  (例: 2024-08,2024-09)
+  - カンマ区切りで2つの月を指定
+  - 年-月の形式で指定（例: 2024-08）
+
+注意:
+  - 引数なしで実行すると、現在の日付から過去2か月のデータを自動処理します
+  - ファイル名のみ指定した場合、resultsディレクトリ内を検索します
+  - 絶対パスまたは相対パスで指定することも可能です
+  - ファイル名にスペースが含まれる場合は引用符で囲んでください
+  - 月指定時は、該当月のデータを含むファイルを自動検索します
+""")
+
+
+def parse_months_argument(months_str: str) -> list:
+    """月指定の引数をパースする"""
+    try:
+        months = months_str.split(',')
+        if len(months) != 2:
+            raise ValueError("2つの月を指定してください")
+        
+        parsed_months = []
+        for month in months:
+            month = month.strip()
+            # YYYY-MM形式をチェック
+            if len(month) != 7 or month[4] != '-':
+                raise ValueError(f"月の形式が正しくありません: {month}")
+            
+            year, month_num = month.split('-')
+            if not year.isdigit() or not month_num.isdigit():
+                raise ValueError(f"年月が数値ではありません: {month}")
+            
+            month_num = int(month_num)
+            if month_num < 1 or month_num > 12:
+                raise ValueError(f"月の値が範囲外です: {month_num}")
+            
+            parsed_months.append((int(year), month_num))
+        
+        return parsed_months
+    except Exception as e:
+        print(f"❌ 月指定の解析エラー: {e}")
+        print("💡 正しい形式: --months 2024-08,2024-09")
+        return None
+
+
+def get_past_two_months() -> list:
+    """現在の日付から過去2か月を計算する"""
+    current_date = datetime.now()
+    
+    # 今月の1日
+    current_month = current_date.replace(day=1)
+    
+    # 先月の1日
+    last_month = (current_month - timedelta(days=1)).replace(day=1)
+    
+    # 先々月の1日
+    two_months_ago = (last_month - timedelta(days=1)).replace(day=1)
+    
+    months = [
+        (last_month.year, last_month.month),      # 先月
+        (two_months_ago.year, two_months_ago.month)  # 先々月
+    ]
+    
+    return months
+
+
+def find_files_for_months(months: list) -> list:
+    """指定された月に対応するファイルを検索する"""
+    results_dir = Path("results")
+    if not results_dir.exists():
+        print("❌ resultsディレクトリが見つかりません")
         return []
-    months = sorted(by_month.keys(), reverse=True)[:2]
-    result: list[Path] = []
-    for m in months:
-        # 初回/再受付の2種があれば両方、片方だけでも追加
-        # 安定順で: 再受付→初回受付
-        files = sorted(by_month[m], key=lambda p: ("初回受付" in p.name, p.name))
-        result.extend(files)
-    return result
+    
+    # 月名のマッピング
+    month_names = {
+        1: "1月", 2: "2月", 3: "3月", 4: "4月", 5: "5月", 6: "6月",
+        7: "7月", 8: "8月", 9: "9月", 10: "10月", 11: "11月", 12: "12月"
+    }
+    
+    target_files = []
+    for year, month in months:
+        month_name = month_names[month]
+        # 該当月を含むファイルを検索
+        pattern_files = list(results_dir.glob(f"*{month_name}*.xlsx"))
+        if pattern_files:
+            target_files.extend(pattern_files)
+            print(f"📅 {year}年{month_name}: {len(pattern_files)}ファイル見つかりました")
+        else:
+            print(f"⚠️ {year}年{month_name}: 該当ファイルが見つかりません")
+    
+    return target_files
 
 
 def main() -> int:
-    # results配下の直近2か月分の「その他」4ファイルを自動検出して一括処理
-    results_dir = Path("results")
-    targets = _find_last_two_months_others(results_dir)
-    if not targets:
-        print("❌ 対象ファイルが見つかりません（results/内の 'X月_再受付/初回受付_その他.xlsx' を確認）")
+    """サイト分類別の円グラフを作成するメイン関数"""
+    try:
+        # ヘルプ表示
+        if len(sys.argv) > 1 and sys.argv[1] in ["--help", "-h", "-?"]:
+            show_help()
+            return 0
+        
+        # 月指定の処理
+        if len(sys.argv) > 1 and sys.argv[1].startswith("--months"):
+            if len(sys.argv) < 3:
+                print("❌ --months の後に月を指定してください")
+                print("💡 例: python site_pie.py --months 2024-08,2024-09")
+                return 1
+            
+            months = parse_months_argument(sys.argv[2])
+            if months is None:
+                return 1
+            
+            print(f"🎯 指定された月: {months[0][0]}年{months[0][1]}月, {months[1][0]}年{months[1][1]}月")
+            target_files = find_files_for_months(months)
+            
+            if not target_files:
+                print("❌ 指定された月のファイルが見つかりません")
+                return 1
+            
+            # 重複を除去
+            target_files = list(set(target_files))
+            print(f"📁 処理対象ファイル: {[f.name for f in target_files]}")
+            
+            # 全てのファイルを処理
+            success_count = 0
+            error_count = 0
+            
+            for i, target in enumerate(target_files, 1):
+                print(f"\n--- 処理 {i}/{len(target_files)} ---")
+                print(f"🎯 処理開始: {target.name}")
+                
+                try:
+                    result = add_reception_pivot_pie(target, chart_title="サイト分類別割合")
+                    if result == 0:
+                        print(f"✅ 処理完了: {target.name}")
+                        success_count += 1
+                    else:
+                        print(f"❌ 処理失敗: {target.name}")
+                        error_count += 1
+                except Exception as e:
+                    print(f"❌ 処理中にエラー: {target.name} - {e}")
+                    error_count += 1
+            
+            # 処理結果のサマリー
+            print(f"\n=== 処理完了サマリー ===")
+            print(f"✅ 成功: {success_count} ファイル")
+            print(f"❌ 失敗: {error_count} ファイル")
+            print(f"📊 合計: {len(target_files)} ファイル")
+            
+            return 0 if error_count == 0 else 1
+        
+        # コマンドライン引数でファイル名が指定されているかチェック
+        if len(sys.argv) > 1 and sys.argv[1] != "--test" and sys.argv[1] != "--all":
+            # 指定されたファイルを処理
+            specified_file = sys.argv[1]
+            target = Path(specified_file)
+            
+            # 相対パスの場合はresultsディレクトリ内を検索
+            if not target.is_absolute():
+                results_dir = Path("results")
+                if results_dir.exists():
+                    target = results_dir / specified_file
+                else:
+                    print("❌ resultsディレクトリが見つかりません")
+                    return 1
+            
+            if not target.exists():
+                print(f"❌ 指定されたファイルが見つかりません: {target}")
+                print("💡 ヒント: ファイル名が正しいか確認してください")
+                print("💡 ヒント: python site_pie.py --help で使用方法を確認")
+                return 1
+            
+            print(f"🎯 指定されたファイルを処理: {target.name}")
+            result = add_reception_pivot_pie(target, chart_title="サイト分類別割合")
+            if result == 0:
+                print(f"✅ 処理完了: {target.name}")
+            else:
+                print(f"❌ 処理失敗: {target.name}")
+            return result
+        
+        # --all オプションの処理
+        if len(sys.argv) > 1 and sys.argv[1] == "--all":
+            # resultsディレクトリ内の全ファイルを処理
+            results_dir = Path("results")
+            if not results_dir.exists():
+                print("❌ resultsディレクトリが見つかりません")
+                return 1
+            
+            # Excelファイルを検索（その他ファイルを優先）
+            excel_files = list(results_dir.glob("*.xlsx"))
+            if not excel_files:
+                print("❌ resultsディレクトリにExcelファイルが見つかりません")
+                return 1
+            
+            # その他ファイルを優先的に処理
+            target_files = []
+            for file in excel_files:
+                if "その他" in file.name:
+                    target_files.insert(0, file)  # 先頭に追加
+                else:
+                    target_files.append(file)
+            
+            print(f"📁 処理対象ファイル: {[f.name for f in target_files]}")
+            print(f"🎯 合計 {len(target_files)} ファイルを処理します")
+            print("💡 特定のファイルのみ処理したい場合は: python site_pie.py ファイル名.xlsx")
+            
+            # 全てのファイルを処理
+            success_count = 0
+            error_count = 0
+            
+            for i, target in enumerate(target_files, 1):
+                print(f"\n--- 処理 {i}/{len(target_files)} ---")
+                print(f"🎯 処理開始: {target.name}")
+                
+                try:
+                    result = add_reception_pivot_pie(target, chart_title="サイト分類別割合")
+                    if result == 0:
+                        print(f"✅ 処理完了: {target.name}")
+                        success_count += 1
+                    else:
+                        print(f"❌ 処理失敗: {target.name}")
+                        error_count += 1
+                except Exception as e:
+                    print(f"❌ 処理中にエラー: {target.name} - {e}")
+                    error_count += 1
+            
+            # 処理結果のサマリー
+            print(f"\n=== 処理完了サマリー ===")
+            print(f"✅ 成功: {success_count} ファイル")
+            print(f"❌ 失敗: {error_count} ファイル")
+            print(f"📊 合計: {len(target_files)} ファイル")
+            
+            return 0 if error_count == 0 else 1
+        
+        # 引数なしの場合は過去2か月を自動処理
+        print("🔄 過去2か月のデータを自動処理します...")
+        months = get_past_two_months()
+        print(f"🎯 対象期間: {months[0][0]}年{months[0][1]}月, {months[1][0]}年{months[1][1]}月")
+        
+        target_files = find_files_for_months(months)
+        
+        if not target_files:
+            print("❌ 過去2か月のファイルが見つかりません")
+            print("💡 ヒント: python site_pie.py --all で全ファイルを処理")
+            print("💡 ヒント: python site_pie.py --help で使用方法を確認")
+            return 1
+        
+        # 重複を除去
+        target_files = list(set(target_files))
+        print(f"📁 処理対象ファイル: {[f.name for f in target_files]}")
+        
+        # 全てのファイルを処理
+        success_count = 0
+        error_count = 0
+        
+        for i, target in enumerate(target_files, 1):
+            print(f"\n--- 処理 {i}/{len(target_files)} ---")
+            print(f"🎯 処理開始: {target.name}")
+            
+            try:
+                result = add_reception_pivot_pie(target, chart_title="サイト分類別割合")
+                if result == 0:
+                    print(f"✅ 処理完了: {target.name}")
+                    success_count += 1
+                else:
+                    print(f"❌ 処理失敗: {target.name}")
+                    error_count += 1
+            except Exception as e:
+                print(f"❌ 処理中にエラー: {target.name} - {e}")
+                error_count += 1
+        
+        # 処理結果のサマリー
+        print(f"\n=== 処理完了サマリー ===")
+        print(f"✅ 成功: {success_count} ファイル")
+        print(f"❌ 失敗: {error_count} ファイル")
+        print(f"📊 合計: {len(target_files)} ファイル")
+        
+        return 0 if error_count == 0 else 1
+        
+    except Exception as e:
+        print(f"❌ メイン処理でエラー: {e}")
         return 1
-    print("🎯 処理対象ファイル:")
-    for t in targets:
-        print(f" - {t}")
-    # タイトルは任意で差し替え可
-    any_error = False
-    for t in targets:
-        code = add_reception_pivot_pie(t, chart_title="サイト分類別割合")
-        if code != 0:
-            any_error = True
-    print("🏁 処理完了")
-    return 1 if any_error else 0
 
 
 if __name__ == "__main__":
-    import sys
-    
-    # テストモードの場合はテストを実行
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        test_classification()
-        raise SystemExit(0)
-    
-    raise SystemExit(main())
+    try:
+        # テストモードの場合はテストを実行
+        if len(sys.argv) > 1 and sys.argv[1] == "--test":
+            test_classification()
+            raise SystemExit(0)
+        
+        exit_code = main()
+        if exit_code != 0:
+            print(f"⚠️ 処理が正常に完了しませんでした（終了コード: {exit_code}）")
+        raise SystemExit(exit_code)
+    except KeyboardInterrupt:
+        print("\n⚠️ 処理が中断されました")
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"❌ 予期しないエラー: {e}")
+        raise SystemExit(1)
