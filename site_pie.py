@@ -247,9 +247,8 @@ def lambda_handler(event, context):
 				if not res.get("success"):
 					errors.append(f"{name}: {res.get('error')}")
 					continue
-				# UL（別名で保存）
-				ts = res.get("timestamp")
-				out_key = f"{upload_prefix.rstrip('/')}/site_pivot_{ts}_{name}"
+				# UL（別名で保存）: 同名上書きのためタイムスタンプを外す
+				out_key = f"{upload_prefix.rstrip('/')}/site_pivot_{name}"
 				s3.upload_file(str(local), s3_bucket, out_key)
 				processed.append({"bucket": s3_bucket, "key": out_key, "source_key": key})
 			except Exception as e:
