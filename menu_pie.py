@@ -299,10 +299,10 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
             labels = Reference(pivot_ws, min_col=1, min_row=2, max_row=row-1)
             print(f"🔍 デバッグ: データ参照設定完了 - データ範囲: B1:B{row-1}, ラベル範囲: A2:A{row-1}")
             
-            # データを追加
-            chart.add_data(data, titles_from_data=False)
+            # データを追加（ヘッダー行をタイトルとして使用）
+            chart.add_data(data, titles_from_data=True)
             chart.set_categories(labels)
-            print(f"🔍 デバッグ: グラフデータ設定完了 - titles_from_data=False")
+            print(f"🔍 デバッグ: グラフデータ設定完了 - titles_from_data=True")
             
             # データラベルを設定
             chart.dataLabels = DataLabelList()
@@ -396,7 +396,8 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
             if bucket_name:
                 # S3キーを生成
                 file_name = target_path.name
-                s3_key = f"{upload_prefix}menu_pivot_{timestamp}_{file_name}"
+                # 同名上書き: タイムスタンプを外し、同一キーで常に最新に置換
+                s3_key = f"{upload_prefix}menu_pivot_{file_name}"
                 print(f"🔍 デバッグ: S3キー: '{s3_key}'")
                 
                 s3_result = upload_to_s3(str(target_path), bucket_name, s3_key)
@@ -621,6 +622,19 @@ def lambda_handler(event, context):
     """S3上の直近2か月分のExcelファイルを自動検索して処理し、結果をS3に保存"""
     try:
         print(f"Lambda関数が呼び出されました。イベント: {json.dumps(event, ensure_ascii=False)}")
+        # オプション: 明示的にmain()を呼びたい場合（ローカル処理フロー）
+        if event and isinstance(event, dict) and event.get("invoke_main"):
+            print("🔧 invoke_main フラグを検知。main() を実行します。")
+            exit_code = main()
+            status = 200 if exit_code == 0 else 500
+            return {
+                'statusCode': status,
+                'body': json.dumps({
+                    'success': exit_code == 0,
+                    'mode': 'main',
+                    'exit_code': exit_code,
+                }, ensure_ascii=False)
+            }
         
         # 環境変数から取得
         s3_bucket = os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
@@ -641,6 +655,7 @@ def lambda_handler(event, context):
         
         # 直近2か月分のファイルを自動検索
         print(f"🔍 直近2か月分のファイルを検索中...")
+        print(f"📁 Lambda関数: S3バケット '{s3_bucket}' からファイルを検索中...")
         target_files = _list_last_two_months_files(s3_client, s3_bucket, s3_prefix, process_type)
         
         if not target_files:
@@ -648,6 +663,7 @@ def lambda_handler(event, context):
             return {"statusCode": 404, "body": json.dumps({"success": False, "error": "対象ファイルが見つかりません"}, ensure_ascii=False)}
         
         print(f"✅ {len(target_files)}個のファイルが見つかりました")
+        print(f"🎯 合計 {len(target_files)} ファイルを処理します")
         for i, file_info in enumerate(target_files):
             print(f"  [{i+1}] {file_info['name']}")
         
@@ -657,13 +673,16 @@ def lambda_handler(event, context):
             s3_path = f"s3://{file_info['bucket']}/{file_info['key']}"
             files_to_process.append(s3_path)
         
+        print(f"📁 処理対象ファイル: {[os.path.basename(path) for path in files_to_process]}")
         print(f"処理対象ファイル一覧: {files_to_process}")
         
         processed_files = []
         uploaded_files = []
         errors = []
         
-        for file_path in files_to_process:
+        for i, file_path in enumerate(files_to_process, 1):
+            print(f"\n--- 処理 {i}/{len(files_to_process)} ---")
+            print(f"🎯 処理開始: {os.path.basename(file_path)}")
             print(f"処理中: {file_path}")
             
             # パス修正
@@ -707,6 +726,9 @@ def lambda_handler(event, context):
                 
                 if result.get('success', False):
                     processed_files.append(file_path)
+                    print(f"✅ 処理完了: {os.path.basename(file_path)}")
+                    print(f"   カテゴリ数: {len(result.get('categories', []))}")
+                    print(f"   総件数: {result.get('total_count', 0)}")
                     if 's3_upload' in result and result['s3_upload'] and result['s3_upload'].get('success', False):
                         uploaded_files.append(result['s3_upload']['s3_path'])
                         print(f"✅ S3アップロード成功: {result['s3_upload']['s3_path']}")
@@ -714,10 +736,17 @@ def lambda_handler(event, context):
                         s3_error = result.get('s3_upload', {}).get('error', 'S3アップロードが実行されませんでした')
                         print(f"⚠️ S3アップロード失敗: {s3_error}")
                 else:
+                    print(f"❌ 処理失敗: {os.path.basename(file_path)} - {result.get('error', '不明なエラー')}")
                     errors.append(f"ファイル処理に失敗: {file_path} - {result.get('error', '不明なエラー')}")
                     
             except Exception as e:
                 errors.append(f"S3からのダウンロードに失敗: {file_path} - {str(e)}")
+        
+        # 処理結果のサマリー
+        print(f"\n=== 処理完了サマリー ===")
+        print(f"✅ 成功: {len(processed_files)} ファイル")
+        print(f"❌ 失敗: {len(errors)} ファイル")
+        print(f"📊 合計: {len(files_to_process)} ファイル")
         
         # 結果を返す
         status = 207 if errors and processed_files else (200 if processed_files else 500)
