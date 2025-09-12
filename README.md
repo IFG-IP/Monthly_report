@@ -11,7 +11,7 @@
   - HP経由・その他経由で分けて処理
   - matplotlib + win32com.client使用
 
-- **`AWS_monthky_line_chart.py`** - AWS Lambda用
+- **`AWS_monthly_line_chart.py`** - AWS Lambda用
   - openpyxl使用のExcelグラフ生成
   - S3連携機能付き
 
@@ -103,5 +103,6 @@ config.json
 ### AWS認証情報
 - AWS認証情報は環境変数またはAWS CLI設定を使用
 - ハードコードされた認証情報は絶対に含めない
+
 
 ## コミットメ
