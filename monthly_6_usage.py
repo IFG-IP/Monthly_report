@@ -5,6 +5,7 @@ import csv
 from typing import Optional, Tuple, List, Dict
 from datetime import datetime
 import io
+import re
 
 
 def _get_boto3_client_or_none(service: str):
@@ -84,8 +85,13 @@ def parse_datetime(date_str: str) -> Optional[datetime]:
 
 def get_datetime_series(data: List[Dict]) -> List[Optional[datetime]]:
     """データの日時列を datetime(JST) のリストに変換"""
-    from zoneinfo import ZoneInfo
-    JST = ZoneInfo("Asia/Tokyo")
+    try:
+        from zoneinfo import ZoneInfo
+        JST = ZoneInfo("Asia/Tokyo")
+    except:
+        # フォールバック: UTC+9を使用
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
 
     # 使う列を決める（実データが入っている最初の列）
     for col in ["appoint_timestamp", "appoint_datetime_clean", "modify_start_date"]:
@@ -125,21 +131,129 @@ def _create_excel_file(data: List[Dict], output_path: Path, sheet_title: str = "
     
     wb.save(str(output_path))
 
+def add_charts_to_excel(excel_path: Path) -> Dict:
+    """
+    統合されたExcelファイルにグラフを追加する関数
+    site_copy.pyとmenu_copy.pyの機能を統合
+    """
+    try:
+        print(f"📊 グラフ追加開始: {excel_path}")
+        print(f"🔍 ファイル存在確認: {excel_path.exists()}")
+        
+        # ファイルの内容を確認
+        if excel_path.exists():
+            from openpyxl import load_workbook
+            wb = load_workbook(str(excel_path))
+            print(f"📋 既存シート一覧: {wb.sheetnames}")
+            wb.close()
+        
+        # 修正された機能をインポート
+        print("🔍 site_copy.pyをインポート中...")
+        try:
+            from site_copy import _add_site_pie_inplace, _classify_site_code
+            print("✅ site_copy.pyインポート成功")
+        except Exception as e:
+            print(f"❌ site_copy.pyインポート失敗: {e}")
+            return {"success": False, "error": f"site_copy.pyインポート失敗: {e}"}
+        
+        print("🔍 menu_copy.pyをインポート中...")
+        try:
+            from menu_copy import add_pivot_pie, extract_bracket_content
+            print("✅ menu_copy.pyインポート成功")
+        except Exception as e:
+            print(f"❌ menu_copy.pyインポート失敗: {e}")
+            return {"success": False, "error": f"menu_copy.pyインポート失敗: {e}"}
+        
+        results = {
+            "site_chart": {"success": False, "error": None},
+            "menu_chart": {"success": False, "error": None}
+        }
+        
+        # サイト分類別円グラフを追加
+        try:
+            print("  🥧 サイト分類別円グラフを追加中...")
+            site_result = _add_site_pie_inplace(excel_path, "サイト分類別割合")
+            print(f"  📊 サイトグラフ結果: {site_result}")
+            results["site_chart"] = site_result
+            if site_result["success"]:
+                print("  ✅ サイト分類別円グラフ追加完了")
+            else:
+                print(f"  ❌ サイト分類別円グラフ追加失敗: {site_result['error']}")
+        except Exception as e:
+            results["site_chart"] = {"success": False, "error": str(e)}
+            print(f"  ❌ サイト分類別円グラフ追加エラー: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # メニュー分類別円グラフを追加
+        try:
+            print("  🥧 メニュー分類別円グラフを追加中...")
+            menu_result = add_pivot_pie(excel_path, False, None)
+            print(f"  📊 メニューグラフ結果: {menu_result}")
+            results["menu_chart"] = menu_result
+            if menu_result["success"]:
+                print("  ✅ メニュー分類別円グラフ追加完了")
+            else:
+                print(f"  ❌ メニュー分類別円グラフ追加失敗: {menu_result['error']}")
+        except Exception as e:
+            results["menu_chart"] = {"success": False, "error": str(e)}
+            print(f"  ❌ メニュー分類別円グラフ追加エラー: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 最終的なシート一覧を確認
+        print("🔍 最終的なシート一覧を確認中...")
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(str(excel_path))
+            print(f"📋 最終シート一覧: {wb.sheetnames}")
+            wb.close()
+        except Exception as e:
+            print(f"⚠️ シート一覧確認エラー: {e}")
+        
+        # 結果をまとめる
+        success_count = sum(1 for result in results.values() if result["success"])
+        total_count = len(results)
+        
+        return {
+            "success": success_count > 0,
+            "message": f"{success_count}/{total_count} 個のグラフを追加しました",
+            "results": results,
+            "excel_path": str(excel_path)
+        }
+        
+    except Exception as e:
+        print(f"❌ グラフ追加処理エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "excel_path": str(excel_path)
+        }
+
 
 def _get_target_months() -> List[Tuple[int, int]]:
-    """過去2か月の対象月を取得する共通関数"""
-    from zoneinfo import ZoneInfo
-    current_date = datetime.now(ZoneInfo("Asia/Tokyo"))
-    target_months = []
+    """5月・6月の対象月を取得する共通関数"""
+    # 直近2か月の取得ロジックをコメントアウト
+    # from zoneinfo import ZoneInfo
+    # current_date = datetime.now(ZoneInfo("Asia/Tokyo"))
+    # target_months = []
+    # 
+    # for i in range(2):
+    #     if current_date.month - (i + 1) <= 0:
+    #         year = current_date.year - 1
+    #         month = 12 + (current_date.month - (i + 1))
+    #     else:
+    #         year = current_date.year
+    #         month = current_date.month - (i + 1)
+    #     target_months.append((year, month))
     
-    for i in range(2):
-        if current_date.month - (i + 1) <= 0:
-            year = current_date.year - 1
-            month = 12 + (current_date.month - (i + 1))
-        else:
-            year = current_date.year
-            month = current_date.month - (i + 1)
-        target_months.append((year, month))
+    # 5月・6月のデータを取得（2025年）
+    target_months = [
+        (2025, 5),  # 2025年5月
+        (2025, 6)   # 2025年6月
+    ]
     
     return target_months
 
@@ -151,7 +265,7 @@ def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
     # 対象月を取得
     target_months = _get_target_months()
 
-    """フィルタしたデータを月別・カテゴリ別に Excel 出力"""
+    """フィルタしたデータを月別・カテゴリ別に Excel 出力（月ごとに1つのファイル）"""
     if not data:
         # データが空の場合はフォールバックファイルのみ生成
         fb = results_dir / "fallback_all_rows.xlsx"
@@ -185,10 +299,15 @@ def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
 
     def is_hp(site_code: str) -> bool:
         return str(site_code).strip().lower() == "hp"
+    
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
     for target_year, target_month in target_months:
         month_name = f"{target_month}月"
         filtered_data = []
         month_matches = 0
+        
+        # その月のデータをフィルタ
         for i, row in enumerate(data):
             dt = dt_list[i]
             if dt and dt.month == target_month and dt.year == target_year:
@@ -207,16 +326,64 @@ def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
         
         print(f"{month_name}: 月マッチ{month_matches}件, カテゴリマッチ{len(filtered_data)}件")
 
+        # その月のデータがない場合はスキップ
+        if not filtered_data:
+            print(f"⚠️ {month_name}: データがありません")
+            continue
+
+        # カテゴリごとにグループ化
         grouped_data: Dict[str, List[Dict]] = {}
         for category, row in filtered_data:
             grouped_data.setdefault(category, []).append(row)
 
-        results_dir.mkdir(parents=True, exist_ok=True)
+        # 月ごとに1つのExcelファイルを作成
+        filename = f"{month_name}_統合データ.xlsx"
+        out_path = results_dir / filename
+        
+        # 新しいワークブックを作成
+        from openpyxl import Workbook
+        wb = Workbook()
+        
+        # デフォルトシートを削除
+        if 'Sheet' in wb.sheetnames:
+            wb.remove(wb['Sheet'])
+        
+        # 各カテゴリを別々のシートに追加
         for category, rows in grouped_data.items():
-            filename = f"{month_name}_{category}.xlsx"
-            out_path = results_dir / filename
-            _create_excel_file(rows, out_path, "データ")
-            outputs.append(out_path)
+            if rows:  # データがある場合のみシートを作成
+                # シート名を生成（Excelの制限に合わせて調整）
+                sheet_name = f"{month_name}_{category}"
+                if len(sheet_name) > 31:  # Excelのシート名制限
+                    sheet_name = sheet_name[:31]
+                
+                ws = wb.create_sheet(title=sheet_name)
+                
+                # ヘッダーを設定
+                if rows:
+                    headers = list(rows[0].keys())
+                    for col, header in enumerate(headers, 1):
+                        ws.cell(row=1, column=col, value=header)
+                    
+                    # データを書き込み
+                    for row_idx, row_data in enumerate(rows, 2):
+                        for col_idx, header in enumerate(headers, 1):
+                            ws.cell(row=row_idx, column=col_idx, value=row_data.get(header))
+                
+                print(f"  ✅ シート作成: {sheet_name} ({len(rows)}件)")
+        
+        # ファイルを保存
+        wb.save(str(out_path))
+        
+        # グラフを追加
+        print(f"📊 {month_name}にグラフを追加中...")
+        chart_result = add_charts_to_excel(out_path)
+        if chart_result["success"]:
+            print(f"✅ {month_name}グラフ追加完了: {chart_result['message']}")
+        else:
+            print(f"⚠️ {month_name}グラフ追加に問題: {chart_result.get('error', '不明なエラー')}")
+        
+        outputs.append(out_path)
+        print(f"✅ {month_name}統合ファイル作成完了: {filename} ({len(grouped_data)}シート + グラフ)")
 
     # メイン処理でファイルが生成されなかった場合のフォールバック
     if not outputs:

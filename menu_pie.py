@@ -5,15 +5,23 @@ import shutil
 from pathlib import Path
 import sys
 import re
-import boto3
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    # ローカル環境ではboto3が不要
+    boto3 = None
+    ClientError = Exception
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
+
 
 
 def get_s3_client():
     """S3クライアントを取得"""
     try:
+        if boto3 is None:
+            return None
         return boto3.client('s3')
     except Exception as e:
         print(f"S3クライアントの作成に失敗: {e}")
@@ -153,7 +161,10 @@ def extract_bracket_content(menu_name: str) -> str:
     例: "メニューA（カテゴリ1）" → "カテゴリ1"
     """
     if not menu_name or not isinstance(menu_name, str):
-        return "その他"
+        return "健康保険適用の施術を相談したい方"
+    
+    # 文字列を正規化（前後の空白を除去、連続する空白を単一の空白に統一）
+    menu_name = re.sub(r'\s+', ' ', menu_name.strip())
     
     # 括弧のパターンを検索（全角・半角両方対応）
     patterns = [
@@ -167,23 +178,35 @@ def extract_bracket_content(menu_name: str) -> str:
         match = re.search(pattern, menu_name)
         if match:
             content = match.group(1).strip()
-            # 空文字や空白文字のみの場合は「その他」を返す
+            # 空文字や空白文字のみの場合は「健康保険適用の施術を相談したい方」を返す
             if content and not content.isspace():
                 return content
             else:
-                # 空の括弧の場合は「その他」を返す
-                return "その他"
+                # 空の括弧の場合は「健康保険適用の施術を相談したい方」を返す
+                return "健康保険適用の施術を相談したい方"
     
-    # 括弧が見つからない場合は元のメニュー名を返す
-    return menu_name.strip() if menu_name.strip() else "その他"
+    # 括弧が見つからない場合は「健康保険適用の施術を相談したい方」を返す
+    return "健康保険適用の施術を相談したい方"
 
 
-def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket: str = None) -> dict:
+def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket: str = None, original_s3_key: str = None) -> dict:
     """
     メニュー分類別の円グラフを作成する関数
     Lambda環境用に修正（win32comの代わりにopenpyxlを使用）
     """
-    print(f"🎯 グラフ作成開始: {target_path.name}")
+    print(f"🎯 グラフ作成開始: {target_path}")
+    print(f"🔍 デバッグ: target_pathの型: {type(target_path)}")
+    
+    # target_pathがPathオブジェクトであることを確認
+    if not isinstance(target_path, Path):
+        print(f"❌ エラー: target_pathがPathオブジェクトではありません: {type(target_path)}")
+        print(f"❌ エラー: target_pathの内容: {target_path}")
+        return {
+            "success": False,
+            "error": f"target_pathの型エラー: {type(target_path)}"
+        }
+    
+    print(f"🔍 デバッグ: target_pathが存在するか: {target_path.exists()}")
     
     try:
         from openpyxl import load_workbook
@@ -200,187 +223,151 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
         # ファイルを読み込み
         wb = load_workbook(str(target_path))
         
-        # データシートの取得
-        data_ws = None
-        try:
-            data_ws = wb["データ"]
-        except KeyError:
+        # 統合されたExcelファイルの場合、各データシートごとに円グラフを作成
+        print(f"    🔍 メニューグラフ作成開始: {target_path}")
+        print(f"    📋 全シート一覧: {wb.sheetnames}")
+        
+        data_sheets = []
+        for sheet_name in wb.sheetnames:
+            # データシートを特定（グラフシートやピボットシートを除外）
+            if not any(keyword in sheet_name.lower() for keyword in ['ピボット', 'グラフ', 'chart', 'pivot']):
+                data_sheets.append(wb[sheet_name])
+                print(f"    📊 データシートとして認識: {sheet_name}")
+        
+        print(f"    📊 データシート数: {len(data_sheets)}")
+        if not data_sheets:
+            return {
+                "success": False,
+                "error": "データシートが見つかりません"
+            }
+
+        # 各シートごとに円グラフを作成
+        created_charts = 0
+        for i, data_ws in enumerate(data_sheets):
+            print(f"    📊 シート {i+1} 処理中: {data_ws.title}")
+            max_row = data_ws.max_row
+            max_col = data_ws.max_column
+            print(f"    📊 シートサイズ: {max_row}行 x {max_col}列")
+            
+            if max_row <= 1 or max_col <= 0:
+                print(f"    ⚠️ シート {i+1} はデータが不足")
+                continue
+
+            # MENU_NAME列の検索
+            menu_name_col = None
+            for col in range(1, max_col + 1):
+                header_val = data_ws.cell(row=1, column=col).value
+                if header_val == "MENU_NAME":
+                    menu_name_col = col
+                    break
+            
+            if menu_name_col is None:
+                print(f"    ⚠️ シート {i+1} にMENU_NAME列が見つからない")
+                continue
+            
+            print(f"    📊 MENU_NAME列: {menu_name_col}列目")
+
+            # このシートからメニュー名と件数を収集
+            menu_counts = {}
+            total_count = 0
+            
+            for row in range(2, max_row + 1):  # ヘッダー行を除く
+                menu_name = data_ws.cell(row=row, column=menu_name_col).value
+                if menu_name and menu_name != "MENU_NAME":  # ヘッダー行を除外
+                    # 括弧内の内容で分類
+                    category = extract_bracket_content(str(menu_name))
+                    
+                    if category in menu_counts:
+                        menu_counts[category] += 1
+                    else:
+                        menu_counts[category] = 1
+                    total_count += 1
+            
+            
+            print(f"    📊 シート {i+1} から収集: {total_count}件, カテゴリ数: {len(menu_counts)}")
+
+            if not menu_counts:
+                print(f"    ⚠️ シート {i+1} に有効なデータがありません")
+                continue
+
+            # このシート用の円グラフを作成
             try:
-                data_ws = wb.worksheets[0]  # 最初のシート
-            except IndexError:
-                return {
-                    "success": False,
-                    "error": "データシートの取得に失敗"
-                }
+                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                pivot_name = f"ピボット_メニュー分類円_{data_ws.title}_{ts}"
+                # Excelのシート名制限（31文字）に合わせる
+                if len(pivot_name) > 31:
+                    pivot_name = f"メニュー分類円_{data_ws.title}_{ts}"[:31]
+                print(f"    📊 新しいシート作成: '{pivot_name}'")
+                pivot_ws = wb.create_sheet(title=pivot_name)
 
-        # データ範囲の取得
-        max_row = data_ws.max_row
-        max_col = data_ws.max_column
-        
-        if max_row <= 1 or max_col <= 0:
-            return {
-                "success": False,
-                "error": "データが不足しています"
-            }
+                # ヘッダーを設定
+                pivot_ws['A1'] = "メニュー分類"
+                pivot_ws['B1'] = "件数"
+                pivot_ws['C1'] = "割合(%)"
 
-        # MENU_NAME列の検索
-        menu_name_col = None
-        for col in range(1, max_col + 1):
-            header_val = data_ws.cell(row=1, column=col).value
-            if header_val == "MENU_NAME":
-                menu_name_col = col
-                break
-        
-        if menu_name_col is None:
-            return {
-                "success": False,
-                "error": "MENU_NAME列が見つかりません"
-            }
+                # データを書き出し（件数順にソート）
+                row = 2
+                for category, count in sorted(menu_counts.items(), key=lambda x: x[1], reverse=True):
+                    percentage = (count / total_count * 100) if total_count > 0 else 0
+                    pivot_ws[f'A{row}'] = category
+                    pivot_ws[f'B{row}'] = count
+                    pivot_ws[f'C{row}'] = round(percentage, 1)
+                    row += 1
 
-        # メニュー名と件数を収集
-        menu_counts = {}
-        total_count = 0
-        
-        for row in range(2, max_row + 1):  # ヘッダー行を除く
-            menu_name = data_ws.cell(row=row, column=menu_name_col).value
-            if menu_name and menu_name != "MENU_NAME":  # ヘッダー行を除外
-                # 括弧内の内容で分類
-                category = extract_bracket_content(str(menu_name))
-                if category in menu_counts:
-                    menu_counts[category] += 1
+                # 円グラフを作成
+                chart = PieChart()
+                chart.title = f"メニュー分類別割合"
+                
+                # データ範囲を正しく設定
+                if row > 2:  # データが存在する場合
+                    data = Reference(pivot_ws, min_col=2, min_row=1, max_row=row-1)
+                    labels = Reference(pivot_ws, min_col=1, min_row=2, max_row=row-1)
+                    chart.add_data(data, titles_from_data=True)
+                    chart.set_categories(labels)
                 else:
-                    menu_counts[category] = 1
-                total_count += 1
+                    # データが少ない場合はサンプルデータを追加
+                    pivot_ws['A2'] = "データなし"
+                    pivot_ws['B2'] = 1
+                    pivot_ws['C2'] = 100.0
+                    data = Reference(pivot_ws, min_col=2, min_row=1, max_row=2)
+                    labels = Reference(pivot_ws, min_col=1, min_row=2, max_row=2)
+                    chart.add_data(data, titles_from_data=True)
+                    chart.set_categories(labels)
+                
+                # データラベルを設定
+                chart.dataLabels = DataLabelList()
+                chart.dataLabels.showPercent = True
+                chart.dataLabels.showCatName = True
+                
+                # 凡例を非表示にする
+                chart.legend = None
+                
+                # グラフのサイズを設定（大きめに調整）
+                chart.width = 20
+                chart.height = 15
+                
+                # グラフをシートに追加
+                pivot_ws.add_chart(chart, "A5")
+                
+                created_charts += 1
+                print(f"    ✅ シート {i+1} のメニュー分類円グラフ作成完了")
+                
+            except Exception as e:
+                print(f"    ❌ シート {i+1} の円グラフ作成エラー: {e}")
+                continue
 
-        print(f"📊 データ収集完了 - 総件数: {total_count}, カテゴリ数: {len(menu_counts)}")
+        print(f"📊 メニュー分類円グラフ作成完了: {created_charts}個")
 
-        if not menu_counts:
+        if created_charts == 0:
             return {
                 "success": False,
                 "error": "有効なデータが見つかりません"
             }
 
-        # 新しいシートを作成
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        pivot_sheet_name = f"ピボット_メニュー分類円_{timestamp}"
-        print(f"🔍 デバッグ: 新しいシート作成: '{pivot_sheet_name}'")
-        pivot_ws = wb.create_sheet(title=pivot_sheet_name)
-        print(f"🔍 デバッグ: シート作成完了")
-
-        # ヘッダーを設定
-        pivot_ws['A1'] = "メニュー分類"
-        pivot_ws['B1'] = "件数"
-        pivot_ws['C1'] = "割合(%)"
-        print(f"🔍 デバッグ: ヘッダー設定完了")
-
-        # データを書き出し（件数順にソート）
-        print(f"🔍 デバッグ: ピボットデータの書き出し開始")
-        row = 2
-        for category, count in sorted(menu_counts.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / total_count * 100) if total_count > 0 else 0
-            pivot_ws[f'A{row}'] = category
-            pivot_ws[f'B{row}'] = count
-            pivot_ws[f'C{row}'] = round(percentage, 1)
-            print(f"🔍 デバッグ: 行{row} - カテゴリ: '{category}', 件数: {count}, 割合: {round(percentage, 1)}%")
-            row += 1
-        
-        print(f"🔍 デバッグ: ピボットデータ書き出し完了 - 最終行: {row-1}")
-
-        # 円グラフを作成
-        print(f"🔍 デバッグ: 円グラフ作成開始 - データ行数: {row-1}")
-        
-        try:
-            chart = PieChart()
-            chart.title = "メニュー分類別割合"
-            print(f"🔍 デバッグ: グラフタイトル設定完了")
-            
-            # データ範囲を設定
-            data = Reference(pivot_ws, min_col=2, min_row=1, max_row=row-1)
-            labels = Reference(pivot_ws, min_col=1, min_row=2, max_row=row-1)
-            print(f"🔍 デバッグ: データ参照設定完了 - データ範囲: B1:B{row-1}, ラベル範囲: A2:A{row-1}")
-            
-            # データを追加（ヘッダー行をタイトルとして使用）
-            chart.add_data(data, titles_from_data=True)
-            chart.set_categories(labels)
-            print(f"🔍 デバッグ: グラフデータ設定完了 - titles_from_data=True")
-            
-            # データラベルを設定
-            chart.dataLabels = DataLabelList()
-            chart.dataLabels.showPercent = True
-            chart.dataLabels.showCatName = True
-            print(f"🔍 デバッグ: データラベル設定完了")
-            
-            # グラフのサイズを設定
-            chart.width = 15
-            chart.height = 10
-            print(f"🔍 デバッグ: グラフサイズ設定完了")
-            
-        except Exception as e:
-            print(f"❌ グラフ作成でエラー: {e}")
-            return {
-                "success": False,
-                "error": f"グラフ作成に失敗: {str(e)}"
-            }
-        
-        # グラフをシートに追加
-        print(f"🔍 デバッグ: グラフをシートに追加中...")
-        
-        # グラフをA列の下に配置（より見やすい位置）
-        try:
-            pivot_ws.add_chart(chart, "A5")
-            print(f"🔍 デバッグ: グラフ追加完了 - 位置: A5")
-            
-            # グラフが正しく追加されたか確認
-            if hasattr(pivot_ws, '_charts') and pivot_ws._charts:
-                print(f"🔍 デバッグ: グラフが正常に追加されました - グラフ数: {len(pivot_ws._charts)}")
-            else:
-                print(f"❌ グラフの追加に失敗しました")
-                
-        except Exception as e:
-            print(f"❌ グラフの追加でエラー: {e}")
-            # 別の位置で試す
-            try:
-                pivot_ws.add_chart(chart, "E1")
-                print(f"🔍 デバッグ: グラフをE1に追加しました")
-            except Exception as e2:
-                print(f"❌ グラフの追加で再エラー: {e2}")
-        
-        # グラフの位置を確認
-        print(f"🔍 デバッグ: グラフオブジェクト: {chart}")
-        print(f"🔍 デバッグ: グラフのタイトル: {chart.title}")
-
         # ファイルを保存
         print(f"🔍 デバッグ: ファイル保存開始: {target_path}")
         wb.save(str(target_path))
         print(f"🔍 デバッグ: ファイル保存完了")
-        
-        # 保存後のシート確認
-        saved_wb = load_workbook(str(target_path))
-        print(f"🔍 デバッグ: 保存後のシート一覧: {[ws.title for ws in saved_wb.worksheets]}")
-        if pivot_sheet_name in [ws.title for ws in saved_wb.worksheets]:
-            print(f"✅ グラフ作成完了: {pivot_sheet_name}")
-            
-            # グラフシートの詳細確認
-            pivot_sheet = saved_wb[pivot_sheet_name]
-            print(f"🔍 デバッグ: グラフシートの最大行: {pivot_sheet.max_row}")
-            print(f"🔍 デバッグ: グラフシートの最大列: {pivot_sheet.max_column}")
-            
-            # グラフが存在するか確認
-            if hasattr(pivot_sheet, '_charts') and pivot_sheet._charts:
-                print(f"🔍 デバッグ: グラフの数: {len(pivot_sheet._charts)}")
-                for i, chart in enumerate(pivot_sheet._charts):
-                    print(f"🔍 デバッグ: グラフ{i+1}: {type(chart)}")
-                    print(f"🔍 デバッグ: グラフ{i+1}の位置: {chart.anchor}")
-            else:
-                print(f"❌ グラフが見つかりません")
-                
-            # データの確認
-            print(f"🔍 デバッグ: A1の値: {pivot_sheet['A1'].value}")
-            print(f"🔍 デバッグ: B1の値: {pivot_sheet['B1'].value}")
-            print(f"🔍 デバッグ: A2の値: {pivot_sheet['A2'].value}")
-            print(f"🔍 デバッグ: B2の値: {pivot_sheet['B2'].value}")
-        else:
-            print(f"❌ グラフシートが見つかりません: {pivot_sheet_name}")
         
         # S3にアップロード（フラグがTrueの場合）
         s3_result = None
@@ -390,14 +377,12 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
             bucket_name = s3_bucket or os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
             # バケット名のスペースを除去
             bucket_name = bucket_name.strip() if bucket_name else None
-            upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'results/')
+            upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
             print(f"🔍 デバッグ: バケット名: '{bucket_name}', プレフィックス: '{upload_prefix}'")
             
             if bucket_name:
-                # S3キーを生成
-                file_name = target_path.name
-                # 同名上書き: タイムスタンプを外し、同一キーで常に最新に置換
-                s3_key = f"{upload_prefix}menu_pivot_{file_name}"
+                # 元のファイルと同じキーで上書き保存
+                s3_key = original_s3_key if original_s3_key else f"{upload_prefix}{target_path.name}"
                 print(f"🔍 デバッグ: S3キー: '{s3_key}'")
                 
                 s3_result = upload_to_s3(str(target_path), bucket_name, s3_key)
@@ -409,9 +394,8 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
         return {
             "success": True,
             "message": f"更新完了: {target_path.name}",
-            "categories": list(menu_counts.keys()),
-            "total_count": total_count,
-            "timestamp": timestamp,
+            "created_charts": created_charts,
+            "timestamp": datetime.now().strftime("%Y%m%d%H%M%S"),
             "s3_upload": s3_result
         }
         
@@ -522,8 +506,12 @@ def add_site_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bu
         chart.dataLabels.showPercent = True
         chart.dataLabels.showCatName = True
         
-        # グラフをシートに追加
-        pivot_ws.add_chart(chart, "E3")
+        # グラフのサイズを設定（メニュー名と被らないよう大きく調整）
+        chart.width = 25
+        chart.height = 18
+        
+        # グラフをシートに追加（右側に配置してメニュー名と被らないように）
+        pivot_ws.add_chart(chart, "F3")
 
         # ファイルを保存
         wb.save(str(target_path))
@@ -533,7 +521,7 @@ def add_site_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bu
         if upload_to_s3_flag:
             # 引数で渡されたバケット名を使用、なければ環境変数から取得
             bucket_name = s3_bucket or os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
-            upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'results/')
+            upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
             
             if bucket_name:
                 # S3キーを生成
@@ -565,6 +553,22 @@ def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3:
     Excelファイルを処理する関数
     """
     try:
+        # file_pathが文字列であることを確認
+        if not isinstance(file_path, str):
+            print(f"❌ エラー: file_pathが文字列ではありません: {type(file_path)}")
+            return {
+                "success": False,
+                "error": f"file_pathの型エラー: {type(file_path)}"
+            }
+        
+        # file_pathが文字列であることを確認
+        if not isinstance(file_path, str):
+            print(f"❌ エラー: file_pathが文字列ではありません: {type(file_path)}")
+            return {
+                "success": False,
+                "error": f"file_pathの型エラー: {type(file_path)}"
+            }
+        
         target_path = Path(file_path)
         
         if not target_path.exists():
@@ -591,8 +595,10 @@ def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3:
 
 
 def _list_last_two_months_files(s3, bucket: str, prefix: str, process_type: str = "menu") -> List[Dict[str, str]]:
-    """直近2か月分のファイルを検索する関数"""
-    pattern = re.compile(r"(\d+)月_(再受付|初回受付)_.*\.xlsx$")
+    """5月・6月分の統合データファイルを検索する関数"""
+    # 5月・6月の統合データファイルを検索
+    target_months = [5, 6]  # 5月と6月
+    pattern = re.compile(r"(\d+)月_統合データ\.xlsx$")
     paginator = s3.get_paginator("list_objects_v2")
     by_month: Dict[int, List[Dict[str, str]]] = {}
     
@@ -603,17 +609,23 @@ def _list_last_two_months_files(s3, bucket: str, prefix: str, process_type: str 
             m = pattern.search(name)
             if m:
                 month = int(m.group(1))
-                by_month.setdefault(month, []).append({"bucket": bucket, "key": key, "name": name})
+                # 5月・6月のみを対象とする
+                if month in target_months:
+                    by_month.setdefault(month, []).append({"bucket": bucket, "key": key, "name": name})
     
     if not by_month:
+        print("⚠️ 5月・6月の統合データファイルが見つかりませんでした")
         return []
     
-    months = sorted(by_month.keys(), reverse=True)[:2]
+    # 5月・6月の順で結果を返す
     result: List[Dict[str, str]] = []
-    for m in months:
-        # 再受付→初回受付の順で安定化
-        files = sorted(by_month[m], key=lambda x: ("初回受付" in x["name"], x["name"]))
-        result.extend(files)
+    for m in target_months:
+        if m in by_month:
+            files = by_month[m]
+            result.extend(files)
+            print(f"✅ {m}月の統合データファイル: {len(files)}件")
+        else:
+            print(f"⚠️ {m}月の統合データファイルが見つかりませんでした")
     
     return result
 
@@ -641,7 +653,7 @@ def lambda_handler(event, context):
         # バケット名のスペースを除去
         s3_bucket = s3_bucket.strip() if s3_bucket else None
         s3_prefix = os.environ.get('S3_OUTPUT_PREFIX', 'bigquery-data/')
-        upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'results/')
+        upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
         process_type = os.environ.get('PROCESS_TYPE', 'menu')
         
         print(f"🔍 デバッグ: 環境変数 - バケット: '{s3_bucket}', プレフィックス: '{s3_prefix}', アップロードプレフィックス: '{upload_prefix}'")
@@ -653,80 +665,149 @@ def lambda_handler(event, context):
         if not s3_client:
             return {"statusCode": 500, "body": json.dumps({"success": False, "error": "S3クライアントの作成に失敗"}, ensure_ascii=False)}
         
-        # 直近2か月分のファイルを自動検索
-        print(f"🔍 直近2か月分のファイルを検索中...")
-        print(f"📁 Lambda関数: S3バケット '{s3_bucket}' からファイルを検索中...")
-        target_files = _list_last_two_months_files(s3_client, s3_bucket, s3_prefix, process_type)
+        # Step Functions用の入力形式に対応
+        input_files = event.get('input_files', event.get('input', event.get('uploaded', [])))
         
-        if not target_files:
-            print("❌ 対象ファイルが見つかりません")
-            return {"statusCode": 404, "body": json.dumps({"success": False, "error": "対象ファイルが見つかりません"}, ensure_ascii=False)}
+        # 入力ファイルが指定されていない場合は、直近2か月分のファイルを自動検索
+        if not input_files:
+            print(f"🔍 直近2か月分のファイルを検索中...")
+            print(f"📁 Lambda関数: S3バケット '{s3_bucket}' からファイルを検索中...")
+            target_files = _list_last_two_months_files(s3_client, s3_bucket, s3_prefix, process_type)
+            
+            if not target_files:
+                print("❌ 対象ファイルが見つかりません")
+                return {"statusCode": 404, "body": json.dumps({"success": False, "error": "対象ファイルが見つかりません"}, ensure_ascii=False)}
+            
+            print(f"✅ {len(target_files)}個のファイルが見つかりました")
+            # 自動検索結果をinput_files形式に変換
+            input_files = [f"s3://{s3_bucket}/{t['key']}" for t in target_files]
         
-        print(f"✅ {len(target_files)}個のファイルが見つかりました")
-        print(f"🎯 合計 {len(target_files)} ファイルを処理します")
-        for i, file_info in enumerate(target_files):
-            print(f"  [{i+1}] {file_info['name']}")
+        print(f"🔍 デバッグ: 入力ファイル数: {len(input_files)}")
         
-        # ファイルパスを構築
+        # 処理対象ファイルを準備検索する
         files_to_process = []
-        for file_info in target_files:
-            s3_path = f"s3://{file_info['bucket']}/{file_info['key']}"
-            files_to_process.append(s3_path)
+        for file_path in input_files:
+            if isinstance(file_path, str) and file_path.startswith('s3://'):
+                # S3パスの正規化
+                if 'your-bucket' in file_path:
+                    file_path = file_path.replace('your-bucket', s3_bucket)
+                file_path = file_path.strip()
+                
+                # S3パスを解析
+                if not file_path.startswith('s3://'):
+                    print(f"⚠️ 無効なS3パス: {file_path}")
+                    continue
+                    
+                # s3://bucket/key を解析
+                path_parts = file_path[5:].split('/', 1)
+                if len(path_parts) != 2:
+                    print(f"⚠️ 無効なS3パス形式: {file_path}")
+                    continue
+                    
+                bucket_name = path_parts[0].strip()
+                s3_key = path_parts[1].strip()
+                
+                # バケット名の検証
+                if not re.match(r'^[a-zA-Z0-9.\-_]{1,255}$', bucket_name):
+                    print(f"⚠️ 無効なバケット名: {bucket_name}")
+                    continue
+                
+                filename = s3_key.split('/')[-1]
+                print(f"🔍 デバッグ: ファイル名抽出 - s3_key: {s3_key}, filename: {filename}, 型: {type(filename)}")
+                
+                file_info = {
+                    's3_path': file_path,
+                    'bucket': bucket_name,
+                    'key': s3_key,
+                    'filename': filename
+                }
+                print(f"🔍 デバッグ: 追加するfile_info: {file_info}")
+                print(f"🔍 デバッグ: file_infoの型: {type(file_info)}")
+                files_to_process.append(file_info)
         
-        print(f"📁 処理対象ファイル: {[os.path.basename(path) for path in files_to_process]}")
-        print(f"処理対象ファイル一覧: {files_to_process}")
+        if not files_to_process:
+            print("❌ 処理対象ファイルがありません")
+            return {"statusCode": 400, "body": json.dumps({"success": False, "error": "処理対象ファイルがありません"}, ensure_ascii=False)}
+        
+        print(f"🎯 合計 {len(files_to_process)} ファイルを処理します")
+        print(f"🔍 デバッグ: files_to_processの型: {type(files_to_process)}")
+        print(f"🔍 デバッグ: files_to_processの長さ: {len(files_to_process)}")
+        
+        for i, file_info in enumerate(files_to_process):
+            print(f"  [{i+1}] file_info: {file_info}")
+            print(f"  [{i+1}] file_infoの型: {type(file_info)}")
+            if isinstance(file_info, dict) and 'filename' in file_info:
+                print(f"  [{i+1}] filename: {file_info['filename']}")
+            else:
+                print(f"  [{i+1}] filenameが見つかりません")
+        
+        # files_to_processの詳細を確認
+        print(f"🔍 デバッグ: files_to_processの内容:")
+        for i, file_info in enumerate(files_to_process):
+            print(f"  [{i+1}] file_info: {file_info}")
+            print(f"  [{i+1}] file_infoの型: {type(file_info)}")
+            if isinstance(file_info, dict):
+                print(f"  [{i+1}] file_infoのキー: {list(file_info.keys())}")
+                if 'filename' in file_info:
+                    print(f"  [{i+1}] filename: {file_info['filename']}, 型: {type(file_info['filename'])}")
+            print()
         
         processed_files = []
         uploaded_files = []
         errors = []
         
-        for i, file_path in enumerate(files_to_process, 1):
+        for i, file_info in enumerate(files_to_process, 1):
             print(f"\n--- 処理 {i}/{len(files_to_process)} ---")
-            print(f"🎯 処理開始: {os.path.basename(file_path)}")
-            print(f"処理中: {file_path}")
+            print(f"🔍 デバッグ: ループ開始 - file_info: {file_info}")
+            print(f"🔍 デバッグ: file_infoの型: {type(file_info)}")
             
-            # パス修正
-            if file_path.startswith('s3://'):
-                # スペースを除去（先頭と末尾のスペースも除去）
-                file_path = file_path.strip()
-                # your-bucketを正しいバケット名に置き換え
-                if 'your-bucket' in file_path:
-                    file_path = file_path.replace('your-bucket', s3_bucket)
-                # results/をbigquery-data/に置き換え
-                if f'/{upload_prefix}' in file_path:
-                    file_path = file_path.replace(f'/{upload_prefix}', f'/{s3_prefix}')
+            # file_infoが辞書でない場合はエラー
+            if not isinstance(file_info, dict):
+                print(f"❌ エラー: file_infoが辞書ではありません: {type(file_info)}")
+                errors.append(f"file_infoの型エラー: {type(file_info)}")
+                continue
             
-            # S3パスを解析
-            if not file_path.startswith('s3://'):
-                errors.append(f"ローカルファイルは処理できません: {file_path}")
-                continue
-                
-            path_parts = file_path[5:].split('/', 1)  # s3://を除去
-            if len(path_parts) != 2:
-                errors.append(f"無効なS3パス: {file_path}")
-                continue
-                
-            bucket_name, s3_key = path_parts
-            bucket_name = bucket_name.strip()  # バケット名のスペースを除去
-            s3_key = s3_key.lstrip('/').strip()  # 先頭スラッシュとスペースを除去
+            print(f"🎯 処理開始: {file_info['filename']}")
+            print(f"処理中: {file_info['s3_path']}")
             
             # ローカルファイル名を生成
-            filename = os.path.basename(s3_key)
-            local_path = Path("/tmp") / filename
+            print(f"🔍 デバッグ: file_info: {file_info}")
+            print(f"🔍 デバッグ: file_infoの型: {type(file_info)}")
+            print(f"🔍 デバッグ: file_infoのキー: {list(file_info.keys()) if isinstance(file_info, dict) else 'N/A'}")
+            print(f"🔍 デバッグ: file_info['filename']: {file_info['filename']}")
+            print(f"🔍 デバッグ: file_info['filename']の型: {type(file_info['filename'])}")
+            print(f"🔍 デバッグ: file_info['filename']の内容: {repr(file_info['filename'])}")
+            
+            # filenameが文字列でない場合はエラー
+            if not isinstance(file_info['filename'], str):
+                print(f"❌ エラー: filenameが文字列ではありません: {type(file_info['filename'])}")
+                errors.append(f"filenameの型エラー: {type(file_info['filename'])}")
+                continue
+            
+            local_path = Path("/tmp") / file_info['filename']
+            print(f"🔍 デバッグ: local_path作成後: {local_path}, 型: {type(local_path)}")
             
             try:
                 # 直接S3からダウンロード
-                s3_client.download_file(bucket_name, s3_key, str(local_path))
+                s3_client.download_file(file_info['bucket'], file_info['key'], str(local_path))
                 print(f"ダウンロード成功: {local_path}")
                 
                 # ファイル処理
-                print(f"🔍 デバッグ: process_excel_file呼び出し - ファイル: {local_path}, タイプ: {process_type}, S3アップロード: True, バケット: {s3_bucket}")
-                result = process_excel_file(str(local_path), process_type, True, s3_bucket)
+                print(f"🔍 デバッグ: add_pivot_pie呼び出し - ファイル: {local_path}, 型: {type(local_path)}, S3アップロード: True, バケット: {s3_bucket}")
+                print(f"🔍 デバッグ: local_pathが存在するか: {local_path.exists()}")
+                # local_pathがPathオブジェクトであることを確認
+                if not isinstance(local_path, Path):
+                    print(f"❌ エラー: local_pathがPathオブジェクトではありません: {type(local_path)}")
+                    errors.append(f"ファイルパスの型エラー: {type(local_path)}")
+                    continue
+                
+                print(f"🔍 デバッグ: add_pivot_pie呼び出し前 - local_path: {local_path}, 型: {type(local_path)}")
+                result = add_pivot_pie(local_path, True, s3_bucket, file_info['key'])
                 print(f"🔍 デバッグ: 処理結果: {result}")
                 
                 if result.get('success', False):
-                    processed_files.append(file_path)
-                    print(f"✅ 処理完了: {os.path.basename(file_path)}")
+                    processed_files.append(file_info['s3_path'])
+                    print(f"✅ 処理完了: {file_info['filename']}")
                     print(f"   カテゴリ数: {len(result.get('categories', []))}")
                     print(f"   総件数: {result.get('total_count', 0)}")
                     if 's3_upload' in result and result['s3_upload'] and result['s3_upload'].get('success', False):
@@ -736,11 +817,11 @@ def lambda_handler(event, context):
                         s3_error = result.get('s3_upload', {}).get('error', 'S3アップロードが実行されませんでした')
                         print(f"⚠️ S3アップロード失敗: {s3_error}")
                 else:
-                    print(f"❌ 処理失敗: {os.path.basename(file_path)} - {result.get('error', '不明なエラー')}")
-                    errors.append(f"ファイル処理に失敗: {file_path} - {result.get('error', '不明なエラー')}")
+                    print(f"❌ 処理失敗: {file_info['filename']} - {result.get('error', '不明なエラー')}")
+                    errors.append(f"ファイル処理に失敗: {file_info['s3_path']} - {result.get('error', '不明なエラー')}")
                     
             except Exception as e:
-                errors.append(f"S3からのダウンロードに失敗: {file_path} - {str(e)}")
+                errors.append(f"S3からのダウンロードに失敗: {file_info['s3_path']} - {str(e)}")
         
         # 処理結果のサマリー
         print(f"\n=== 処理完了サマリー ===")
@@ -779,18 +860,18 @@ def lambda_handler(event, context):
 def main() -> int:
     """メニュー分類別の円グラフを作成するメイン関数"""
     try:
-        # resultsディレクトリ内のファイルを自動検索
-        results_dir = Path("results")
+        # bigquery-dataディレクトリ内のファイルを自動検索
+        bigquery_data_dir = Path("bigquery-data")
         
-        if not results_dir.exists():
-            print("❌ resultsディレクトリが見つかりません")
+        if not bigquery_data_dir.exists():
+            print("❌ bigquery-dataディレクトリが見つかりません")
             return 1
         
         # Excelファイルを検索
-        excel_files = list(results_dir.glob("*.xlsx"))
+        excel_files = list(bigquery_data_dir.glob("*.xlsx"))
         
         if not excel_files:
-            print("❌ resultsディレクトリにExcelファイルが見つかりません")
+            print("❌ bigquery-dataディレクトリにExcelファイルが見つかりません")
             return 1
         
         # その他ファイルを優先的に処理
@@ -845,17 +926,17 @@ def show_help():
 📊 メニュー分類別円グラフ作成ツール (openpyxl版)
 
 使用方法:
-  python menu_copy.py                    # resultsディレクトリ内の全ファイルを処理
+  python menu_copy.py                    # bigquery-dataディレクトリ内の全ファイルを処理
   python menu_copy.py ファイル名.xlsx     # 特定のファイルを処理
   python menu_copy.py --help             # このヘルプを表示
 
 例:
   python menu_copy.py 7月_初回受付_その他.xlsx
   python menu_copy.py "6月_再受付_hp.xlsx"
-  python menu_copy.py results/7月_初回受付_hp.xlsx
+  python menu_copy.py bigquery-data/7月_初回受付_hp.xlsx
 
 注意:
-  - ファイル名のみ指定した場合、resultsディレクトリ内を検索します
+  - ファイル名のみ指定した場合、bigquery-dataディレクトリ内を検索します
   - 絶対パスまたは相対パスで指定することも可能です
   - ファイル名にスペースが含まれる場合は引用符で囲んでください
   - openpyxlライブラリが必要です: pip install openpyxl
@@ -875,13 +956,13 @@ if __name__ == "__main__":
             specified_file = sys.argv[1]
             target = Path(specified_file)
             
-            # 相対パスの場合はresultsディレクトリ内を検索
+            # 相対パスの場合はbigquery-dataディレクトリ内を検索
             if not target.is_absolute():
-                results_dir = Path("results")
-                if results_dir.exists():
-                    target = results_dir / specified_file
+                bigquery_data_dir = Path("bigquery-data")
+                if bigquery_data_dir.exists():
+                    target = bigquery_data_dir / specified_file
                 else:
-                    print("❌ resultsディレクトリが見つかりません")
+                    print("❌ bigquery-dataディレクトリが見つかりません")
                     raise SystemExit(1)
             
             if not target.exists():
@@ -901,7 +982,7 @@ if __name__ == "__main__":
                 print(f"❌ 処理失敗: {target.name} - {result.get('error', '不明なエラー')}")
                 raise SystemExit(1)
         else:
-            # ファイル名が指定されていない場合は、resultsディレクトリ内のファイルを自動検索
+            # ファイル名が指定されていない場合は、bigquery-dataディレクトリ内のファイルを自動検索
             exit_code = main()
             if exit_code != 0:
                 print(f"⚠️ 処理が正常に完了しませんでした（終了コード: {exit_code}）")

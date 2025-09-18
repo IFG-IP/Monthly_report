@@ -8,11 +8,23 @@ import json
 import csv
 from collections import defaultdict
 
-# Python 3.13互換性のための修正
-if not hasattr(os, 'add_dll_directory'):
-    def add_dll_directory(path):
-        pass
-    os.add_dll_directory = add_dll_directory
+# Excel操作用のライブラリをインポート
+try:
+    import xlsxwriter
+    XLSXWRITER_AVAILABLE = True
+    print("✅ xlsxwriterのインポート成功")
+except ImportError as e:
+    print(f"❌ xlsxwriterのインポート失敗: {e}")
+    XLSXWRITER_AVAILABLE = False
+
+try:
+    import openpyxl
+    from openpyxl.chart import LineChart, Reference
+    OPENPYXL_AVAILABLE = True
+    print("✅ openpyxlのインポート成功")
+except ImportError as e:
+    print(f"❌ openpyxlのインポート失敗: {e}")
+    OPENPYXL_AVAILABLE = False
 
 def get_s3_client():
     """S3クライアントを取得"""
@@ -80,8 +92,8 @@ def upload_to_s3(file_path: str, bucket_name: str, s3_key: str) -> dict:
     """ファイルをS3にアップロード"""
     try:
         print(f"🔍 デバッグ: S3アップロード開始")
-        print(f"🔍 デバッグ: ファイルパス: '{file_path}'")
-        print(f"🔍 デバッグ: バケット名: '{bucket_name}'")
+        print(f" デバッグ: ファイルパス: '{file_path}'")
+        print(f" デバッグ: バケット名: '{bucket_name}'")
         print(f"🔍 デバッグ: S3キー: '{s3_key}'")
         
         # バケット名の正規化（スペースを除去）
@@ -128,7 +140,7 @@ def load_csv_data(csv_path: Path):
             return None
         
         file_size = os.path.getsize(csv_path)
-        print(f"📁 ファイルサイズ: {file_size} bytes")
+        print(f" ファイルサイズ: {file_size} bytes")
         
         # 複数のエンコーディングを試す
         encodings = [
@@ -139,7 +151,7 @@ def load_csv_data(csv_path: Path):
         
         for encoding in encodings:
             try:
-                print(f"🔍 エンコーディング試行: {encoding}")
+                print(f" エンコーディング試行: {encoding}")
                 with open(csv_path, 'r', encoding=encoding) as file:
                     reader = csv.DictReader(file)
                     for row in reader:
@@ -208,7 +220,7 @@ def create_monthly_summary(data, site_type: str = "all"):
     """月別の初回受付・再受付の集計を作成（HP/その他別）"""
     try:
         # 年月でグループ化
-        monthly_data = defaultdict(lambda: {'初回受付': 0, '再受付': 0, '合計': 0})
+        monthly_data = defaultdict(lambda: {'初回受付': 0, '再受付': 0, '初回キャンセル': 0, '合計': 0})
         
         for row in data:
             # サイトタイプでフィルタリング
@@ -226,13 +238,15 @@ def create_monthly_summary(data, site_type: str = "all"):
                 
             year_month = appoint_date.strftime('%Y-%m')
             
-            # 初回受付・再受付を判定（例：appoint_type列がある場合）
-            appoint_type = row.get('appoint_type', '').strip()
+            # SYSTEM_USAGE_NAMEによる受付種別の判定
+            system_usage = row.get('SYSTEM_USAGE_NAME', '').strip()
             
-            if '初回' in appoint_type or 'first' in appoint_type.lower():
+            if '初回受付' in system_usage:
                 monthly_data[year_month]['初回受付'] += 1
-            elif '再' in appoint_type or 'repeat' in appoint_type.lower():
+            elif '再受付' in system_usage:
                 monthly_data[year_month]['再受付'] += 1
+            elif '初回キャンセル' in system_usage:
+                monthly_data[year_month]['初回キャンセル'] += 1
             else:
                 # デフォルトで初回受付として扱う
                 monthly_data[year_month]['初回受付'] += 1
@@ -253,139 +267,659 @@ def create_monthly_summary(data, site_type: str = "all"):
         print(f"❌ {site_type}月別集計エラー: {e}")
         return None
 
-
-def save_to_csv(hp_data, other_data, output_path: Path) -> bool:
-    """CSVファイルに結果を保存"""
+def create_combined_data(hp_data, other_data):
+    """HPとその他のデータを統合してグラフ用のデータを作成"""
     try:
-        print(f"🔍 デバッグ: CSVファイル保存開始: {output_path}")
+        # 全月のリストを作成
+        all_months = set()
+        if hp_data:
+            all_months.update([d['月'] for d in hp_data])
+        if other_data:
+            all_months.update([d['月'] for d in other_data])
         
-        # HPデータをCSVに保存
-        hp_csv_path = output_path.with_suffix('_HP.csv')
-        with open(hp_csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-            if hp_data:
-                fieldnames = hp_data[0].keys()
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(hp_data)
+        all_months = sorted(list(all_months))
         
-        # その他データをCSVに保存
-        other_csv_path = output_path.with_suffix('_その他.csv')
-        with open(other_csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-            if other_data:
-                fieldnames = other_data[0].keys()
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(other_data)
+        # 統合データを作成
+        combined_data = []
+        for month in all_months:
+            # HPデータを取得
+            hp_month_data = next((d for d in hp_data if d['月'] == month), {
+                '月': month, '初回受付': 0, '再受付': 0, '初回キャンセル': 0, '合計': 0
+            })
+            
+            # その他データを取得
+            other_month_data = next((d for d in other_data if d['月'] == month), {
+                '月': month, '初回受付': 0, '再受付': 0, '初回キャンセル': 0, '合計': 0
+            })
+            
+            # 統合データを作成
+            combined_data.append({
+                '月': month,
+                'HP初回受付': hp_month_data['初回受付'],
+                'HP再受付': hp_month_data['再受付'],
+                'その他初回受付': other_month_data['初回受付'],
+                'その他再受付': other_month_data['再受付'],
+                'HP合計': hp_month_data['合計'],
+                'その他合計': other_month_data['合計'],
+                '総合計': hp_month_data['合計'] + other_month_data['合計']
+            })
         
-        print(f"✅ CSVファイル保存完了: {hp_csv_path}, {other_csv_path}")
+        return combined_data
+        
+    except Exception as e:
+        print(f"❌ 統合データ作成エラー: {e}")
+        return None
+
+def create_excel_with_enhanced_chart(hp_data, other_data, output_path: Path) -> bool:
+    """xlsxwriterで新しいExcelファイルを作成（AWS_monthly_line_chart.pyと同じ方式）"""
+    try:
+        if not XLSXWRITER_AVAILABLE:
+            print("❌ xlsxwriterが利用できないため、Excelファイルは作成されません")
+            return False
+            
+        print(f"🔍 デバッグ: xlsxwriterで新しいExcelファイル作成開始")
+        
+        # 新しいExcelファイルを作成
+        workbook = xlsxwriter.Workbook(str(output_path))
+        
+        # フォーマットを定義
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#D3D3D3',
+            'border': 1
+        })
+        
+        data_format = workbook.add_format({
+            'border': 1
+        })
+        
+        # 1. HP経由シートを作成
+        if hp_data:
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            ws_hp = workbook.add_worksheet(f'HP月別集計_{timestamp}')
+            
+            # ヘッダーを書き込み
+            hp_headers = ['月', '初回受付', '再受付', '初回キャンセル', '合計']
+            for col, header in enumerate(hp_headers):
+                ws_hp.write(0, col, header, header_format)
+            
+            # データを書き込み
+            for row, data_point in enumerate(hp_data, 1):
+                ws_hp.write(row, 0, data_point['月'], data_format)
+                ws_hp.write(row, 1, data_point['初回受付'], data_format)
+                ws_hp.write(row, 2, data_point['再受付'], data_format)
+                ws_hp.write(row, 3, data_point['初回キャンセル'], data_format)
+                ws_hp.write(row, 4, data_point['合計'], data_format)
+            
+            # 列幅を自動調整
+            for col in range(len(hp_headers)):
+                ws_hp.set_column(col, col, 15)
+            
+            # HP用のグラフを作成（xlsxwriter版）
+            create_hp_chart_xlsxwriter(workbook, ws_hp, hp_data, f'HP月別集計_{timestamp}')
+        
+        # 2. その他経由シートを作成
+        if other_data:
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            ws_other = workbook.add_worksheet(f'その他月別集計_{timestamp}')
+            
+            # ヘッダーを書き込み
+            other_headers = ['月', '初回受付', '再受付', '初回キャンセル', '合計']
+            for col, header in enumerate(other_headers):
+                ws_other.write(0, col, header, header_format)
+            
+            # データを書き込み
+            for row, data_point in enumerate(other_data, 1):
+                ws_other.write(row, 0, data_point['月'], data_format)
+                ws_other.write(row, 1, data_point['初回受付'], data_format)
+                ws_other.write(row, 2, data_point['再受付'], data_format)
+                ws_other.write(row, 3, data_point['初回キャンセル'], data_format)
+                ws_other.write(row, 4, data_point['合計'], data_format)
+            
+            # 列幅を自動調整
+            for col in range(len(other_headers)):
+                ws_other.set_column(col, col, 15)
+            
+            # その他用のグラフを作成（xlsxwriter版）
+            create_other_chart_xlsxwriter(workbook, ws_other, other_data, f'その他月別集計_{timestamp}')
+        
+        # ワークブックを閉じる
+        workbook.close()
+        
+        print(f"✅ xlsxwriterで新しいExcelファイル作成完了: {output_path}")
         return True
         
     except Exception as e:
-        print(f"❌ CSVファイル保存エラー: {e}")
+        print(f"❌ 拡張Excelファイル作成エラー: {e}")
         return False
 
-def save_to_excel_with_chart(hp_data, other_data, output_path: Path) -> bool:
-    """Excelファイルに結果とグラフを保存（openpyxl使用）"""
+
+def create_hp_chart_xlsxwriter(workbook, worksheet, hp_data, sheet_name):
+    """HP用のグラフを作成（AWS_monthly_line_chart.pyと完全に同じスタイル）"""
     try:
-        print(f"🔍 デバッグ: openpyxlのインポートを試行中...")
-        print(f"🔍 デバッグ: Pythonパス: {sys.path}")
-        try:
-            from openpyxl import Workbook
-            from openpyxl.chart import LineChart, Reference
-            from openpyxl.chart.axis import DateAxis
-            print(f"✅ デバッグ: openpyxlのインポート成功")
-        except ImportError as e:
-            print(f"❌ デバッグ: openpyxlのインポート失敗: {e}")
-            raise
+        if not XLSXWRITER_AVAILABLE:
+            print("❌ xlsxwriterが利用できないため、グラフは作成されません")
+            return False
+            
+        # グラフを作成
+        chart = workbook.add_chart({'type': 'line'})
         
-        # ワークブックを作成
-        print(f"🔍 デバッグ: ワークブック作成開始")
-        wb = Workbook()
-        print(f"✅ デバッグ: ワークブック作成完了")
+        # グラフのタイトルとスタイル（AWS_monthly_line_chart.pyと完全に同じ）
+        chart.set_title({
+            'name': f'月別予約受付数推移 ({sheet_name})',
+            'name_font': {'size': 16, 'bold': True}
+        })
         
-        # HP用のシート
-        print(f"🔍 デバッグ: HPシート作成開始")
-        ws_hp = wb.active
-        ws_hp.title = 'HP経由'
-        print(f"✅ デバッグ: HPシート作成完了")
+        # データ系列を追加（HP用の色 - AWS_monthly_line_chart.pyと完全に同じ）
+        series_colors = [
+            {'name': '初回受付', 'color': '#2E8B57'},      # 緑色
+            {'name': '再受付', 'color': '#4169E1'}        # 青色
+        ]
         
-        # HPデータのヘッダーを設定
-        headers = ['月', '初回受付', '再受付', '合計']
-        for col, header in enumerate(headers, 1):
-            ws_hp.cell(row=1, column=col, value=header)
+        for i, series_info in enumerate(series_colors, 1):
+            chart.add_series({
+                'name': series_info['name'],
+                'categories': [sheet_name, 1, 0, len(hp_data), 0],  # A2:A(last_row)
+                'values': [sheet_name, 1, i, len(hp_data), i],      # B2:C(last_row)
+                'line': {'color': series_info['color'], 'width': 2},
+                'marker': {
+                    'type': 'circle',
+                    'size': 8,
+                    'line': {'color': series_info['color']},
+                    'fill': {'color': series_info['color']}
+                },
+                'data_labels': {
+                    'value': True,
+                    'font': {'size': 13, 'bold': True}
+                }
+            })
         
-        # HPデータを書き込み
-        for row, data_point in enumerate(hp_data, 2):
-            ws_hp.cell(row=row, column=1, value=data_point['月'])
-            ws_hp.cell(row=row, column=2, value=data_point['初回受付'])
-            ws_hp.cell(row=row, column=3, value=data_point['再受付'])
-            ws_hp.cell(row=row, column=4, value=data_point['合計'])
+        # グラフのレイアウト設定（AWS_monthly_line_chart.pyと完全に同じ）
+        chart.set_size({'width': 800, 'height': 400})
         
-        # HP用の折れ線グラフを作成
-        print(f"🔍 デバッグ: HPグラフ作成開始")
-        chart_hp = LineChart()
-        chart_hp.title = "月別予約受付数推移 (HP経由)"
-        chart_hp.style = 13
-        chart_hp.y_axis.title = '件数'
-        chart_hp.x_axis.title = '月'
-        print(f"✅ デバッグ: HPグラフオブジェクト作成完了")
+        # グラフエリア全体の背景色を設定（余白部分も含む）- 薄い緑色
+        chart.set_chartarea({
+            'fill': {'color': '#E8F5E8'}  # 薄い緑色
+        })
         
-        # HPデータ範囲を指定
-        data_hp = Reference(ws_hp, min_col=2, min_row=1, max_row=len(hp_data) + 1, max_col=3)
-        chart_hp.add_data(data_hp, titles_from_data=True)
+        # プロットエリアの背景色を設定
+        chart.set_plotarea({
+            'fill': {'color': '#E8F5E8'},  # 薄い緑色
+            'layout': {
+                'x': 0.1,
+                'y': 0.1,
+                'width': 0.8,
+                'height': 0.8
+            }
+        })
         
-        # HPカテゴリ軸を設定
-        cats_hp = Reference(ws_hp, min_col=1, min_row=2, max_row=len(hp_data) + 1)
-        chart_hp.set_categories(cats_hp)
+        # X軸の設定（ラベルなし）
+        chart.set_x_axis({
+            'num_font': {'size': 10},
+            'major_gridlines': {'visible': False}
+        })
         
-        # HPグラフをワークシートに追加
-        ws_hp.add_chart(chart_hp, "F2")
+        # Y軸の設定（ラベルなし、数値なし）
+        chart.set_y_axis({
+            'num_font': {'color': '#E8F5E8'},  # 数値を背景色と同じにして非表示
+            'major_gridlines': {'visible': False},
+            'minor_gridlines': {'visible': False},
+            'line': {'color': '#E8F5E8'}  # 軸線も背景色と同じにして非表示
+        })
         
-        # その他用のシート
-        ws_other = wb.create_sheet("その他経由")
+        # 凡例の設定
+        chart.set_legend({
+            'position': 'top',
+            'font': {'size': 10, 'bold': True}
+        })
         
-        # その他データのヘッダーを設定
-        for col, header in enumerate(headers, 1):
-            ws_other.cell(row=1, column=col, value=header)
+        # グラフをワークシートに挿入
+        worksheet.insert_chart('F2', chart)
         
-        # その他データを書き込み
-        for row, data_point in enumerate(other_data, 2):
-            ws_other.cell(row=row, column=1, value=data_point['月'])
-            ws_other.cell(row=row, column=2, value=data_point['初回受付'])
-            ws_other.cell(row=row, column=3, value=data_point['再受付'])
-            ws_other.cell(row=row, column=4, value=data_point['合計'])
-        
-        # その他用の折れ線グラフを作成
-        chart_other = LineChart()
-        chart_other.title = "月別予約受付数推移 (その他経由)"
-        chart_other.style = 13
-        chart_other.y_axis.title = '件数'
-        chart_other.x_axis.title = '月'
-        
-        # その他データ範囲を指定
-        data_other = Reference(ws_other, min_col=2, min_row=1, max_row=len(other_data) + 1, max_col=3)
-        chart_other.add_data(data_other, titles_from_data=True)
-        
-        # その他カテゴリ軸を設定
-        cats_other = Reference(ws_other, min_col=1, min_row=2, max_row=len(other_data) + 1)
-        chart_other.set_categories(cats_other)
-        
-        # その他グラフをワークシートに追加
-        ws_other.add_chart(chart_other, "F2")
-        
-        # ファイルを保存
-        wb.save(output_path)
-        print(f"📊 Excelファイル保存完了: {output_path}")
+        print(f"✅ {sheet_name}グラフ作成完了")
         return True
         
     except Exception as e:
-        print(f"❌ Excelファイル保存エラー: {e}")
+        print(f"❌ {sheet_name}グラフ作成エラー: {e}")
         return False
 
-def process_csv_file(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None) -> dict:
-    """CSVファイルを処理して月別グラフを作成"""
+def create_other_chart_xlsxwriter(workbook, worksheet, other_data, sheet_name):
+    """その他用のグラフを作成（AWS_monthly_line_chart.pyと完全に同じスタイル）"""
     try:
-        print(f"🎯 CSVファイル処理開始: {csv_path}")
+        if not XLSXWRITER_AVAILABLE:
+            print("❌ xlsxwriterが利用できないため、グラフは作成されません")
+            return False
+            
+        # グラフを作成
+        chart = workbook.add_chart({'type': 'line'})
+        
+        # グラフのタイトルとスタイル（AWS_monthly_line_chart.pyと完全に同じ）
+        chart.set_title({
+            'name': f'月別予約受付数推移 ({sheet_name})',
+            'name_font': {'size': 16, 'bold': True}
+        })
+        
+        # データ系列を追加（その他用の色 - AWS_monthly_line_chart.pyと完全に同じ）
+        series_colors = [
+            {'name': '初回受付', 'color': '#2E8B57'},      # 緑色
+            {'name': '再受付', 'color': '#4169E1'}        # 青色
+        ]
+        
+        for i, series_info in enumerate(series_colors, 1):
+            chart.add_series({
+                'name': series_info['name'],
+                'categories': [sheet_name, 1, 0, len(other_data), 0],  # A2:A(last_row)
+                'values': [sheet_name, 1, i, len(other_data), i],      # B2:C(last_row)
+                'line': {'color': series_info['color'], 'width': 2},
+                'marker': {
+                    'type': 'circle',
+                    'size': 8,
+                    'line': {'color': series_info['color']},
+                    'fill': {'color': series_info['color']}
+                },
+                'data_labels': {
+                    'value': True,
+                    'font': {'size': 13, 'bold': True}
+                }
+            })
+        
+        # グラフのレイアウト設定（AWS_monthly_line_chart.pyと完全に同じ）
+        chart.set_size({'width': 800, 'height': 400})
+        
+        # グラフエリア全体の背景色を設定（余白部分も含む）
+        chart.set_chartarea({
+            'fill': {'color': '#8EB4E3'}  # グラフ全体の背景色
+        })
+        
+        # プロットエリアの背景色を設定
+        chart.set_plotarea({
+            'fill': {'color': '#8EB4E3'},  # プロットエリアの背景色
+            'layout': {
+                'x': 0.1,
+                'y': 0.1,
+                'width': 0.8,
+                'height': 0.8
+            }
+        })
+        
+        # X軸の設定（ラベルなし）
+        chart.set_x_axis({
+            'num_font': {'size': 10},
+            'major_gridlines': {'visible': False}
+        })
+        
+        # Y軸の設定（ラベルなし、数値なし）
+        chart.set_y_axis({
+            'num_font': {'color': '#8EB4E3'},  # 数値を背景色と同じにして非表示
+            'major_gridlines': {'visible': False},
+            'minor_gridlines': {'visible': False},
+            'line': {'color': '#8EB4E3'}  # 軸線も背景色と同じにして非表示
+        })
+        
+        # 凡例の設定
+        chart.set_legend({
+            'position': 'top',
+            'font': {'size': 10, 'bold': True}
+        })
+        
+        # グラフをワークシートに挿入
+        worksheet.insert_chart('F2', chart)
+        
+        print(f"✅ {sheet_name}グラフ作成完了")
+        return True
+        
+    except Exception as e:
+        print(f"❌ {sheet_name}グラフ作成エラー: {e}")
+        return False
+
+def create_hp_chart_openpyxl(workbook, worksheet, hp_data, sheet_name):
+    """HP用のグラフを作成（シンプルで確実に動作するバージョン）"""
+    try:
+        from openpyxl.chart import LineChart, Reference
+        
+        print(f"🔍 デバッグ: HP用グラフ作成開始 - シート: {sheet_name}")
+        print(f"🔍 デバッグ: データ行数: {len(hp_data)}")
+        
+        # グラフを作成
+        chart = LineChart()
+        chart.title = f'月別予約受付数推移 ({sheet_name})'
+        chart.style = 13
+        
+        # データ範囲を設定（初回受付と再受付のみ、初回キャンセルは除外）
+        data = Reference(worksheet, min_col=2, min_row=1, max_row=len(hp_data)+1, max_col=3)
+        chart.add_data(data, titles_from_data=True)
+        
+        # カテゴリ（月）を設定
+        categories = Reference(worksheet, min_col=1, min_row=2, max_row=len(hp_data)+1)
+        chart.set_categories(categories)
+        
+        # グラフのサイズ設定
+        chart.width = 20
+        chart.height = 10
+        
+        # 軸の設定
+        chart.x_axis.majorGridlines = None
+        chart.y_axis.majorGridlines = None
+        chart.y_axis.minorGridlines = None
+        chart.y_axis.scaling.min = 0
+        
+        # 凡例の設定
+        chart.legend.position = 't'  # top
+        
+        # グラフをシートに追加
+        worksheet.add_chart(chart, "F2")
+        
+        print(f"✅ HP用グラフ作成完了: {sheet_name}")
+        
+    except Exception as e:
+        print(f"❌ HP用グラフ作成エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+def create_other_chart_openpyxl(workbook, worksheet, other_data, sheet_name):
+    """その他用のグラフを作成（シンプルで確実に動作するバージョン）"""
+    try:
+        from openpyxl.chart import LineChart, Reference
+        
+        print(f"🔍 デバッグ: その他用グラフ作成開始 - シート: {sheet_name}")
+        print(f"🔍 デバッグ: データ行数: {len(other_data)}")
+        
+        # グラフを作成
+        chart = LineChart()
+        chart.title = f'月別予約受付数推移 ({sheet_name})'
+        chart.style = 13
+        
+        # データ範囲を設定（初回受付と再受付のみ、初回キャンセルは除外）
+        data = Reference(worksheet, min_col=2, min_row=1, max_row=len(other_data)+1, max_col=3)
+        chart.add_data(data, titles_from_data=True)
+        
+        # カテゴリ（月）を設定
+        categories = Reference(worksheet, min_col=1, min_row=2, max_row=len(other_data)+1)
+        chart.set_categories(categories)
+        
+        # グラフのサイズ設定
+        chart.width = 20
+        chart.height = 10
+        
+        # 軸の設定
+        chart.x_axis.majorGridlines = None
+        chart.y_axis.majorGridlines = None
+        chart.y_axis.minorGridlines = None
+        chart.y_axis.scaling.min = 0
+        
+        # 凡例の設定
+        chart.legend.position = 't'  # top
+        
+        # グラフをシートに追加
+        worksheet.add_chart(chart, "F2")
+        
+        print(f"✅ その他用グラフ作成完了: {sheet_name}")
+        
+    except Exception as e:
+        print(f"❌ その他用グラフ作成エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+def create_hp_chart(workbook, worksheet, hp_data, sheet_name):
+    """HP用のグラフを作成（monthly_line_chart.pyと同じスタイル）"""
+    try:
+        # グラフを作成
+        chart = workbook.add_chart({'type': 'line'})
+        
+        # グラフのタイトルとスタイル
+        chart.set_title({
+            'name': f'月別予約受付数推移 ({sheet_name})',
+            'name_font': {'size': 16, 'bold': True}
+        })
+        
+        # データ系列を追加（HP用の色）
+        series_colors = [
+            {'name': '初回受付', 'color': '#2E8B57'},      # 緑色
+            {'name': '再受付', 'color': '#4169E1'}        # 青色
+        ]
+        
+        for i, series_info in enumerate(series_colors, 1):
+            chart.add_series({
+                'name': series_info['name'],
+                'categories': [sheet_name, 1, 0, len(hp_data), 0],  # A2:A(last_row)
+                'values': [sheet_name, 1, i, len(hp_data), i],      # B2:C(last_row)
+                'line': {'color': series_info['color'], 'width': 2},
+                'marker': {
+                    'type': 'circle',
+                    'size': 8,
+                    'line': {'color': series_info['color']},
+                    'fill': {'color': series_info['color']}
+                },
+                'data_labels': {
+                    'value': True,
+                    'font': {'size': 13, 'bold': True}
+                }
+            })
+        
+        # グラフのレイアウト設定
+        chart.set_size({'width': 800, 'height': 400})
+        
+        # グラフエリア全体の背景色を設定（余白部分も含む）- 薄い緑色
+        chart.set_chartarea({
+            'fill': {'color': '#E8F5E8'}  # 薄い緑色
+        })
+        
+        # プロットエリアの背景色を設定
+        chart.set_plotarea({
+            'fill': {'color': '#E8F5E8'},  # 薄い緑色
+            'layout': {
+                'x': 0.1,
+                'y': 0.1,
+                'width': 0.8,
+                'height': 0.8
+            }
+        })
+        
+        # X軸の設定（ラベルなし）
+        chart.set_x_axis({
+            'num_font': {'size': 10},
+            'major_gridlines': {'visible': False}
+        })
+        
+        # Y軸の設定（ラベルなし、数値なし）
+        chart.set_y_axis({
+            'num_font': {'color': '#E8F5E8'},  # 数値を背景色と同じにして非表示
+            'major_gridlines': {'visible': False},
+            'minor_gridlines': {'visible': False},
+            'line': {'color': '#E8F5E8'}  # 軸線も背景色と同じにして非表示
+        })
+        
+        # 凡例の設定
+        chart.set_legend({
+            'position': 'top',
+            'font': {'size': 10, 'bold': True}
+        })
+        
+        # グラフをワークシートに挿入
+        worksheet.insert_chart('F2', chart)
+        
+        print(f"✅ {sheet_name}グラフ作成完了")
+        
+    except Exception as e:
+        print(f"❌ {sheet_name}グラフ作成エラー: {e}")
+
+def create_other_chart(workbook, worksheet, other_data, sheet_name):
+    """その他用のグラフを作成（monthly_line_chart.pyと同じスタイル）"""
+    try:
+        # グラフを作成
+        chart = workbook.add_chart({'type': 'line'})
+        
+        # グラフのタイトルとスタイル
+        chart.set_title({
+            'name': f'月別予約受付数推移 ({sheet_name})',
+            'name_font': {'size': 16, 'bold': True}
+        })
+        
+        # データ系列を追加（その他用の色）
+        series_colors = [
+            {'name': '初回受付', 'color': '#2E8B57'},      # 緑色
+            {'name': '再受付', 'color': '#4169E1'}        # 青色
+        ]
+        
+        for i, series_info in enumerate(series_colors, 1):
+            chart.add_series({
+                'name': series_info['name'],
+                'categories': [sheet_name, 1, 0, len(other_data), 0],  # A2:A(last_row)
+                'values': [sheet_name, 1, i, len(other_data), i],      # B2:C(last_row)
+                'line': {'color': series_info['color'], 'width': 2},
+                'marker': {
+                    'type': 'circle',
+                    'size': 8,
+                    'line': {'color': series_info['color']},
+                    'fill': {'color': series_info['color']}
+                },
+                'data_labels': {
+                    'value': True,
+                    'font': {'size': 13, 'bold': True}
+                }
+            })
+        
+        # グラフのレイアウト設定
+        chart.set_size({'width': 800, 'height': 400})
+        
+        # グラフエリア全体の背景色を設定（余白部分も含む）
+        chart.set_chartarea({
+            'fill': {'color': '#8EB4E3'}  # グラフ全体の背景色
+        })
+        
+        # プロットエリアの背景色を設定
+        chart.set_plotarea({
+            'fill': {'color': '#8EB4E3'},  # プロットエリアの背景色
+            'layout': {
+                'x': 0.1,
+                'y': 0.1,
+                'width': 0.8,
+                'height': 0.8
+            }
+        })
+        
+        # X軸の設定（ラベルなし）
+        chart.set_x_axis({
+            'num_font': {'size': 10},
+            'major_gridlines': {'visible': False}
+        })
+        
+        # Y軸の設定（ラベルなし、数値なし）
+        chart.set_y_axis({
+            'num_font': {'color': '#8EB4E3'},  # 数値を背景色と同じにして非表示
+            'major_gridlines': {'visible': False},
+            'minor_gridlines': {'visible': False},
+            'line': {'color': '#8EB4E3'}  # 軸線も背景色と同じにして非表示
+        })
+        
+        # 凡例の設定
+        chart.set_legend({
+            'position': 'top',
+            'font': {'size': 10, 'bold': True}
+        })
+        
+        # グラフをワークシートに挿入
+        worksheet.insert_chart('F2', chart)
+        
+        print(f"✅ {sheet_name}グラフ作成完了")
+        
+    except Exception as e:
+        print(f"❌ {sheet_name}グラフ作成エラー: {e}")
+
+def create_combined_chart(workbook, worksheet, combined_data, sheet_name):
+    """統合グラフを作成（monthly_line_chart.pyと同じスタイル）"""
+    try:
+        # グラフを作成
+        chart = workbook.add_chart({'type': 'line'})
+        
+        # グラフのタイトルとスタイル
+        chart.set_title({
+            'name': '月別予約受付数推移',
+            'name_font': {'size': 16, 'bold': True}
+        })
+        
+        # データ系列を追加（monthly_line_chart.pyと同じ色）
+        series_colors = [
+            {'name': 'HP新規', 'color': '#CD8433'},      # HP初回受付
+            {'name': 'HP再受付', 'color': '#808080'},    # HP再受付
+            {'name': 'WEB新規', 'color': '#2E8B57'},     # その他初回受付
+            {'name': 'WEB再受付', 'color': '#4169E1'}    # その他再受付
+        ]
+        
+        for i, series_info in enumerate(series_colors, 1):
+            chart.add_series({
+                'name': series_info['name'],
+                'categories': [sheet_name, 1, 0, len(combined_data), 0],  # A2:A(last_row)
+                'values': [sheet_name, 1, i, len(combined_data), i],      # B2:E(last_row)
+                'line': {'color': series_info['color'], 'width': 2},
+                'marker': {
+                    'type': 'circle',
+                    'size': 8,
+                    'line': {'color': series_info['color']},
+                    'fill': {'color': series_info['color']}
+                },
+                'data_labels': {
+                    'value': True,
+                    'font': {'size': 13, 'bold': True}
+                }
+            })
+        
+        # グラフのレイアウト設定
+        chart.set_size({'width': 800, 'height': 400})
+        
+        # グラフエリア全体の背景色を設定（余白部分も含む）
+        chart.set_chartarea({
+            'fill': {'color': '#8EB4E3'}  # グラフ全体の背景色
+        })
+        
+        # プロットエリアの背景色を設定
+        chart.set_plotarea({
+            'fill': {'color': '#8EB4E3'},  # プロットエリアの背景色
+            'layout': {
+                'x': 0.1,
+                'y': 0.1,
+                'width': 0.8,
+                'height': 0.8
+            }
+        })
+        
+        # X軸の設定（ラベルなし）
+        chart.set_x_axis({
+            'num_font': {'size': 10},
+            'major_gridlines': {'visible': False}
+        })
+        
+        # Y軸の設定（ラベルなし、数値なし）
+        chart.set_y_axis({
+            'num_font': {'color': '#8EB4E3'},  # 数値を背景色と同じにして非表示
+            'major_gridlines': {'visible': False},
+            'minor_gridlines': {'visible': False},
+            'line': {'color': '#8EB4E3'}  # 軸線も背景色と同じにして非表示
+        })
+        
+        # 凡例の設定
+        chart.set_legend({
+            'position': 'top',
+            'font': {'size': 10, 'bold': True}
+        })
+        
+        # グラフをワークシートに挿入
+        worksheet.insert_chart('G2', chart)
+        
+        print(f"✅ {sheet_name}グラフ作成完了")
+        
+    except Exception as e:
+        print(f"❌ {sheet_name}グラフ作成エラー: {e}")
+
+def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None) -> dict:
+    """CSVファイルを処理して新しい月別集計Excelファイルを作成"""
+    try:
+        print(f" 拡張CSVファイル処理開始: {csv_path}")
+        
+        # S3クライアントを取得（アップロード用）
+        s3_client = get_s3_client()
+        if not s3_client:
+            return {"success": False, "error": "S3クライアントの作成に失敗"}
         
         # CSVファイルを読み込み
         data = load_csv_data(Path(csv_path))
@@ -404,39 +938,38 @@ def process_csv_file(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: 
         if hp_data is None or other_data is None:
             return {"success": False, "error": "月別集計に失敗"}
         
-        # 出力ファイル名を生成（一つにまとめる）
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        base_filename = f"月別集計_一年間_{timestamp}"
+        # 新しいExcelファイルを作成
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        output_filename = f"月別集計_一年間_{timestamp}.xlsx"
+        output_path = Path(f"/tmp/{output_filename}")
         
-        output_path = Path("/tmp") / base_filename
-        
-        # Excelファイルにグラフを作成（HPとその他を一つのファイルに）
         try:
-            excel_success = save_to_excel_with_chart(hp_data, other_data, output_path.with_suffix('.xlsx'))
+            excel_success = create_excel_with_enhanced_chart(hp_data, other_data, output_path)
             
             if not excel_success:
-                return {"success": False, "error": "Excelファイルの作成に失敗"}
+                return {"success": False, "error": "拡張Excelファイルの作成に失敗"}
+                
         except Exception as e:
-            print(f"❌ Excelファイル作成エラー: {str(e)}")
-            return {"success": False, "error": f"Excelファイルの作成に失敗: {str(e)}"}
+            print(f"❌ ファイル作成エラー: {str(e)}")
+            return {"success": False, "error": f"ファイルの作成に失敗: {str(e)}"}
         
         # S3にアップロード（フラグがTrueの場合）
         s3_results = []
         if upload_to_s3_flag and s3_bucket:
             upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
             
-            # Excelファイルをアップロード
-            excel_filename = f"{base_filename}.xlsx"
-            excel_s3_key = f"{upload_prefix}{excel_filename}"
-            excel_result = upload_to_s3(str(output_path.with_suffix('.xlsx')), s3_bucket, excel_s3_key)
-            s3_results.append(excel_result)
+            # 新しい月別集計ファイルをアップロード
+            if output_path.exists():
+                file_s3_key = f"{upload_prefix}{output_filename}"
+                file_result = upload_to_s3(str(output_path), s3_bucket, file_s3_key)
+                s3_results.append(file_result)
         
         # 成功したアップロードのみを結果に含める
         successful_uploads = [result for result in s3_results if result.get('success', False)]
         
         return {
             "success": True,
-            "message": f"処理完了: {base_filename}",
+            "message": f"月別集計ファイル作成完了: {output_filename}",
             "hp_months_count": len(hp_data),
             "other_months_count": len(other_data),
             "excel_created": excel_success,
@@ -445,7 +978,7 @@ def process_csv_file(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: 
         }
         
     except Exception as e:
-        print(f"❌ CSVファイル処理エラー: {e}")
+        print(f"❌ 拡張CSVファイル処理エラー: {e}")
         return {"success": False, "error": f"処理失敗: {str(e)}"}
 
 def lambda_handler(event, context):
@@ -467,14 +1000,14 @@ def lambda_handler(event, context):
             upload_prefix = 'bigquery-data/'
             print("⚠️ デバッグ: 環境変数S3_UPLOAD_PREFIXが設定されていません。デフォルト値を使用します。")
         
-        print(f"🔍 デバッグ: 環境変数S3_BUCKET_NAME: '{os.environ.get('S3_BUCKET_NAME', 'NOT_SET')}'")
+        print(f" デバッグ: 環境変数S3_BUCKET_NAME: '{os.environ.get('S3_BUCKET_NAME', 'NOT_SET')}'")
         print(f"🔍 デバッグ: 環境変数S3_UPLOAD_PREFIX: '{os.environ.get('S3_UPLOAD_PREFIX', 'NOT_SET')}'")
         print(f"🔍 デバッグ: すべての環境変数: {dict(os.environ)}")
         
-        print(f"🔍 デバッグ: 使用するS3バケット: '{s3_bucket}'")
+        print(f" デバッグ: 使用するS3バケット: '{s3_bucket}'")
         print(f"🔍 デバッグ: アップロードプレフィックス: '{upload_prefix}'")
         
-        print(f"🔍 デバッグ: 環境変数 - バケット: '{s3_bucket}', プレフィックス: '{upload_prefix}'")
+        print(f" デバッグ: 環境変数 - バケット: '{s3_bucket}', プレフィックス: '{upload_prefix}'")
         
         if not s3_bucket:
             return {"statusCode": 400, "body": json.dumps({"success": False, "error": "s3_bucketが未指定"}, ensure_ascii=False)}
@@ -482,15 +1015,15 @@ def lambda_handler(event, context):
         # Step Functions用の入力形式に対応（monthly_6_usage形式）
         # 引数: {"s3_bucket": "...", "s3_key": "...", "output_to_s3": true, ...}
         print(f"🔍 デバッグ: 受信したイベント全体: {json.dumps(event, ensure_ascii=False, indent=2)}")
-        print(f"🔍 デバッグ: イベントの型: {type(event)}")
-        print(f"🔍 デバッグ: イベントのキー: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
+        print(f" デバッグ: イベントの型: {type(event)}")
+        print(f" デバッグ: イベントのキー: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
         
         # monthly_6_usage形式の引数からS3情報を取得
         input_s3_bucket = event.get('s3_bucket', 'monthly-report-output-group')
         input_s3_key = event.get('s3_key', 'bigquery-data/web_reservation_leaf_20250901.csv')
         
-        print(f"🔍 デバッグ: 入力S3バケット: {input_s3_bucket}")
-        print(f"🔍 デバッグ: 入力S3キー: {input_s3_key}")
+        print(f" デバッグ: 入力S3バケット: {input_s3_bucket}")
+        print(f" デバッグ: 入力S3キー: {input_s3_key}")
         
         if not input_s3_bucket or not input_s3_key:
             return {"statusCode": 400, "body": json.dumps({"success": False, "error": "s3_bucketまたはs3_keyが指定されていません"}, ensure_ascii=False)}
@@ -499,7 +1032,7 @@ def lambda_handler(event, context):
         s3_path = f"s3://{input_s3_bucket}/{input_s3_key}"
         result_data = {"bucket": input_s3_bucket, "key": input_s3_key}
         
-        print(f"🔍 デバッグ: 構築されたS3パス: {s3_path}")
+        print(f" デバッグ: 構築されたS3パス: {s3_path}")
         print(f"🔍 デバッグ: result_data: {result_data}")
         
         processed_files = []
@@ -529,7 +1062,7 @@ def lambda_handler(event, context):
             
             # S3からファイルをダウンロード
             print(f"⬇️ S3からファイルをダウンロード開始: {s3_path}")
-            print(f"🔍 デバッグ: バケット名: {input_s3_bucket}")
+            print(f" デバッグ: バケット名: {input_s3_bucket}")
             print(f"🔍 デバッグ: オブジェクトキー: {input_s3_key}")
             local_path = download_from_s3(s3_path)
             if not local_path:
@@ -542,9 +1075,9 @@ def lambda_handler(event, context):
             print(f"✅ S3ダウンロード完了: {downloaded_filename}")
             
             # 一つのファイルでHPとその他を処理
-            print(f"🎯 データ処理開始（HPとその他を一つのファイルに）")
+            print(f" データ処理開始（HPとその他を一つのファイルに）")
             
-            result = process_csv_file(
+            result = process_csv_file_enhanced(
                 csv_path=local_path,
                 upload_to_s3_flag=True,
                 s3_bucket=s3_bucket
@@ -583,7 +1116,7 @@ def lambda_handler(event, context):
         print(f"🔍 デバッグ: 最終結果 - 処理済み: {len(processed_files)}, アップロード済み: {len(uploaded_files)}")
         
         return result
-            
+        
     except Exception as e:
         print(f"Lambda関数でエラーが発生: {str(e)}")
         return {
