@@ -114,6 +114,64 @@ def get_datetime_series(data: List[Dict]) -> List[Optional[datetime]]:
     raise ValueError("日時列が見つからない")
 
 
+def filter_last_two_months_data(data: List[Dict]) -> List[Dict]:
+    """appoint_timestampを基準に直近2か月のデータをフィルタリング"""
+    if not data:
+        return data
+    
+    try:
+        from zoneinfo import ZoneInfo
+        JST = ZoneInfo("Asia/Tokyo")
+    except:
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+    
+    # 現在時刻をJSTで取得
+    now = datetime.now(JST)
+    
+    # 直近2か月の開始日を計算（月単位で正確に）
+    current_year = now.year
+    current_month = now.month
+    
+    # 2か月前の月を計算
+    if current_month <= 2:
+        two_months_ago_year = current_year - 1
+        two_months_ago_month = current_month + 10  # 12 + (month - 2)
+    else:
+        two_months_ago_year = current_year
+        two_months_ago_month = current_month - 2
+    
+    # 2か月前の月の1日を開始日とする
+    two_months_ago = datetime(two_months_ago_year, two_months_ago_month, 1, tzinfo=JST)
+    
+    print(f"🔍 フィルタリング条件: {two_months_ago.strftime('%Y年%m月')} 以降")
+    
+    filtered_data = []
+    for row in data:
+        # appoint_timestampを取得
+        timestamp_str = row.get('appoint_timestamp', '')
+        if not timestamp_str:
+            continue
+            
+        # 日時をパース
+        dt = parse_datetime(timestamp_str)
+        if dt is None:
+            continue
+            
+        # JSTに変換
+        if dt.tzinfo:
+            dt = dt.astimezone(JST)
+        else:
+            dt = dt.replace(tzinfo=JST)
+        
+        # 2か月以内かチェック
+        if dt >= two_months_ago:
+            filtered_data.append(row)
+    
+    print(f"📊 フィルタリング結果: {len(data)}件 → {len(filtered_data)}件")
+    return filtered_data
+
+
 def _create_excel_file(data: List[Dict], output_path: Path, sheet_title: str = "データ") -> None:
     """Excelファイルを作成する共通関数"""
     from openpyxl import Workbook
@@ -233,8 +291,8 @@ def add_charts_to_excel(excel_path: Path) -> Dict:
         }
 
 
-def _get_target_months() -> List[Tuple[int, int]]:
-    """5月・6月の対象月を取得する共通関数"""
+def _get_target_months(data: List[Dict]) -> List[Tuple[int, int]]:
+    """直近２か月の対象月を取得する共通関数"""
     # 直近2か月の取得ロジックをコメントアウト
     # from zoneinfo import ZoneInfo
     # current_date = datetime.now(ZoneInfo("Asia/Tokyo"))
@@ -249,13 +307,60 @@ def _get_target_months() -> List[Tuple[int, int]]:
     #         month = current_date.month - (i + 1)
     #     target_months.append((year, month))
     
-    # 5月・6月のデータを取得（2025年）
-    target_months = [
-        (2025, 5),  # 2025年5月
-        (2025, 6)   # 2025年6月
-    ]
+    # データから直近2か月の対象月を動的に取得
+    if not data:
+        return []
     
-    return target_months
+    try:
+        from zoneinfo import ZoneInfo
+        JST = ZoneInfo("Asia/Tokyo")
+    except:
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+    
+    # 現在時刻をJSTで取得
+    now = datetime.now(JST)
+    
+    # 直近2か月の開始日を計算（月単位で正確に）
+    current_year = now.year
+    current_month = now.month
+    
+    # 2か月前の月を計算
+    if current_month <= 2:
+        two_months_ago_year = current_year - 1
+        two_months_ago_month = current_month + 10  # 12 + (month - 2)
+    else:
+        two_months_ago_year = current_year
+        two_months_ago_month = current_month - 2
+    
+    # 2か月前の月の1日を開始日とする
+    two_months_ago = datetime(two_months_ago_year, two_months_ago_month, 1, tzinfo=JST)
+    
+    print(f"🔍 対象期間: {two_months_ago.strftime('%Y年%m月')} 以降")
+    
+    # データから実際に存在する年月を収集
+    months_found = set()
+    for row in data:
+        timestamp_str = row.get('appoint_timestamp', '')
+        if not timestamp_str:
+            continue
+            
+        dt = parse_datetime(timestamp_str)
+        if dt is None:
+            continue
+            
+        # JSTに変換
+        if dt.tzinfo:
+            dt = dt.astimezone(JST)
+        else:
+            dt = dt.replace(tzinfo=JST)
+        
+        # 2か月前の月以降のデータのみを対象
+        if dt >= two_months_ago:
+            months_found.add((dt.year, dt.month))
+    
+    # 年月でソートして返す
+    return sorted(list(months_found))
 
 
 def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
@@ -263,15 +368,11 @@ def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
     outputs: List[Path] = []
 
     # 対象月を取得
-    target_months = _get_target_months()
+    target_months = _get_target_months(data)
 
     """フィルタしたデータを月別・カテゴリ別に Excel 出力（月ごとに1つのファイル）"""
     if not data:
-        # データが空の場合はフォールバックファイルのみ生成
-        fb = results_dir / "fallback_all_rows.xlsx"
-        _create_excel_file([], fb, "ALL")
-        outputs.append(fb)
-        print({"metric":"fallback_emitted","path":str(fb)})
+        print("⚠️ データが空です")
         return outputs
     
     for col in ["SYSTEM_USAGE_NAME", "SITE_CODE"]:
@@ -385,13 +486,6 @@ def _generate_outputs(data: List[Dict], results_dir: Path) -> List[Path]:
         outputs.append(out_path)
         print(f"✅ {month_name}統合ファイル作成完了: {filename} ({len(grouped_data)}シート + グラフ)")
 
-    # メイン処理でファイルが生成されなかった場合のフォールバック
-    if not outputs:
-        fb = results_dir / "fallback_all_rows.xlsx"
-        _create_excel_file(data, fb, "ALL")
-        outputs.append(fb)
-        print({"metric":"fallback_emitted","path":str(fb)})
-
     return outputs
 
 
@@ -421,10 +515,18 @@ def process_monthly_usage(
         return {"success": False, "error": "S3からのCSV読み込みに失敗しました"}
     input_desc = f"s3://{s3_bucket}/{key_to_use}"
 
+    # 直近2か月のデータをフィルタリング
+    print(f"📊 全データ件数: {len(data)}件")
+    filtered_data = filter_last_two_months_data(data)
+    print(f"📊 フィルタリング後: {len(filtered_data)}件")
+    
+    if not filtered_data:
+        return {"success": False, "error": "直近2か月のデータが見つかりませんでした"}
+
     # 出力先: Lambda なら /tmp、ローカルなら bigquery-data/
     out_dir = Path("/tmp" if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else "bigquery-data/")
     try:
-        outputs = _generate_outputs(data, out_dir)
+        outputs = _generate_outputs(filtered_data, out_dir)
     except Exception as e:
         return {"success": False, "error": f"出力生成でエラー: {e}"}
 

@@ -939,7 +939,7 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
             return {"success": False, "error": "月別集計に失敗"}
         
         # 新しいExcelファイルを作成
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        timestamp = datetime.now().strftime('%Y%m')
         output_filename = f"月別集計_一年間_{timestamp}.xlsx"
         output_path = Path(f"/tmp/{output_filename}")
         

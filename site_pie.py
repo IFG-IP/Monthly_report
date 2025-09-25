@@ -256,13 +256,155 @@ def _add_site_pie_inplace(target_path: Path, chart_title: str = "サイト分類
 		return {"success": False, "error": f"処理失敗: {e}"}
 
 
+def _get_target_months_from_data(data: List[Dict]) -> List[Tuple[int, int]]:
+	"""データから直近2か月の対象月を動的に取得する関数"""
+	if not data:
+		return []
+	
+	try:
+		from zoneinfo import ZoneInfo
+		JST = ZoneInfo("Asia/Tokyo")
+	except:
+		from datetime import timezone, timedelta
+		JST = timezone(timedelta(hours=9))
+	
+	# 現在時刻をJSTで取得
+	now = datetime.now(JST)
+	
+	# 直近2か月の開始日を計算（月単位で正確に）
+	current_year = now.year
+	current_month = now.month
+	
+	# 2か月前の月を計算
+	if current_month <= 2:
+		two_months_ago_year = current_year - 1
+		two_months_ago_month = current_month + 10  # 12 + (month - 2)
+	else:
+		two_months_ago_year = current_year
+		two_months_ago_month = current_month - 2
+	
+	# 2か月前の月の1日を開始日とする
+	two_months_ago = datetime(two_months_ago_year, two_months_ago_month, 1, tzinfo=JST)
+	
+	print(f"🔍 対象期間: {two_months_ago.strftime('%Y年%m月')} 以降")
+	
+	# データから実際に存在する年月を収集
+	months_found = set()
+	for row in data:
+		timestamp_str = row.get('appoint_timestamp', '')
+		if not timestamp_str:
+			continue
+			
+		dt = parse_datetime(timestamp_str)
+		if dt is None:
+			continue
+			
+		# JSTに変換
+		if dt.tzinfo:
+			dt = dt.astimezone(JST)
+		else:
+			dt = dt.replace(tzinfo=JST)
+		
+		# 2か月前の月以降のデータのみを対象
+		if dt >= two_months_ago:
+			months_found.add((dt.year, dt.month))
+	
+	# 年月でソートして返す
+	return sorted(list(months_found))
+
+
+def parse_datetime(date_str: str) -> Optional[datetime]:
+	"""日時文字列を datetime に変換（ISO8601/TZ対応）"""
+	if not date_str:
+		return None
+	s = str(date_str).strip()
+	# ISO8601（+00:00 / Z / T区切り）優先
+	try:
+		return datetime.fromisoformat(s.replace("T", " ").replace("Z", "+00:00"))
+	except Exception:
+		pass
+	# 既存フォーマット群
+	for fmt in (
+		"%Y-%m-%d %H:%M:%S.%f",
+		"%Y-%m-%d %H:%M:%S",
+		"%Y-%m-%d",
+		"%Y/%m/%d %H:%M:%S",
+		"%Y/%m/%d",
+	):
+		try:
+			return datetime.strptime(s, fmt)
+		except ValueError:
+			continue
+	return None
+
+
+def load_csv_from_s3(bucket: str, key: str) -> Optional[List[Dict]]:
+	"""S3 から CSV を読み込んで辞書リストとして返す"""
+	s3_client = _get_s3_client()
+	if s3_client is None:
+		return None
+	try:
+		obj = s3_client.get_object(Bucket=bucket, Key=key)
+		body = obj["Body"].read().decode("utf-8-sig")
+		import csv
+		import io
+		reader = csv.DictReader(io.StringIO(body))
+		return list(reader)
+	except Exception:
+		try:
+			obj = s3_client.get_object(Bucket=bucket, Key=key)
+			body = obj["Body"].read().decode("utf-8")
+			import csv
+			import io
+			reader = csv.DictReader(io.StringIO(body))
+			return list(reader)
+		except Exception:
+			return None
+
+
 def _list_last_two_months_others(s3, bucket: str, prefix: str) -> List[Dict[str, str]]:
-	"""5月・6月分の統合データファイルを検索する関数"""
-	# 5月・6月の統合データファイルを検索
-	target_months = [5, 6]  # 5月と6月
+	"""直近2か月分の統合データファイルを検索する関数"""
+	# まずCSVファイルから直近2か月のデータを取得して対象月を決定
+	try:
+		# 最新のCSVファイルを取得
+		paginator = s3.get_paginator("list_objects_v2")
+		latest_csv = None
+		for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+			for obj in page.get("Contents", []):
+				key = obj.get("Key", "")
+				if key.endswith(".csv") and "web_reservation_leaf_" in key:
+					if latest_csv is None or obj["LastModified"] > latest_csv["LastModified"]:
+						latest_csv = obj
+		
+		if latest_csv is None:
+			print("⚠️ CSVファイルが見つかりませんでした")
+			return []
+		
+		# CSVファイルを読み込んで対象月を取得
+		print(f"🔍 CSVファイルから対象月を取得中: {latest_csv['Key']}")
+		csv_data = load_csv_from_s3(bucket, latest_csv['Key'])
+		if not csv_data:
+			print("⚠️ CSVファイルの読み込みに失敗しました")
+			return []
+		
+		# 直近2か月の対象月を取得
+		target_months = _get_target_months_from_data(csv_data)
+		if not target_months:
+			print("⚠️ 直近2か月のデータが見つかりませんでした")
+			return []
+		
+		print(f"🔍 対象月: {target_months}")
+		
+	except Exception as e:
+		print(f"⚠️ CSVファイルからの対象月取得に失敗: {e}")
+		# フォールバック: 固定で5月・6月を使用
+		target_months = [(2025, 5), (2025, 6)]
+		print(f"🔍 フォールバック: 固定月を使用 {target_months}")
+	
+	# 統合データファイルを検索
 	pattern = re.compile(r"(\d+)月_統合データ\.xlsx$")
 	paginator = s3.get_paginator("list_objects_v2")
-	by_month: Dict[int, List[Dict[str, str]]] = {}
+	by_month: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
 	
 	for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
 		for obj in page.get("Contents", []):
@@ -271,23 +413,25 @@ def _list_last_two_months_others(s3, bucket: str, prefix: str) -> List[Dict[str,
 			m = pattern.search(name)
 			if m:
 				month = int(m.group(1))
-				# 5月・6月のみを対象とする
-				if month in target_months:
-					by_month.setdefault(month, []).append({"bucket": bucket, "key": key, "name": name})
+				# 対象月に含まれるかチェック
+				for year, target_month in target_months:
+					if month == target_month:
+						by_month.setdefault((year, month), []).append({"bucket": bucket, "key": key, "name": name})
+						break
 	
 	if not by_month:
-		print("⚠️ 5月・6月の統合データファイルが見つかりませんでした")
+		print("⚠️ 直近2か月の統合データファイルが見つかりませんでした")
 		return []
 	
-	# 5月・6月の順で結果を返す
+	# 対象月の順で結果を返す
 	result: List[Dict[str, str]] = []
-	for m in target_months:
-		if m in by_month:
-			files = by_month[m]
+	for year, month in target_months:
+		if (year, month) in by_month:
+			files = by_month[(year, month)]
 			result.extend(files)
-			print(f"✅ {m}月の統合データファイル: {len(files)}件")
+			print(f"✅ {year}年{month}月の統合データファイル: {len(files)}件")
 		else:
-			print(f"⚠️ {m}月の統合データファイルが見つかりませんでした")
+			print(f"⚠️ {year}年{month}月の統合データファイルが見つかりませんでした")
 	
 	return result
 
