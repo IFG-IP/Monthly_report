@@ -7,6 +7,7 @@ import os
 import json
 import csv
 from collections import defaultdict
+from typing import List, Dict, Any
 
 # Excel操作用のライブラリをインポート
 try:
@@ -33,6 +34,57 @@ def get_s3_client():
     except Exception as e:
         print(f"S3クライアントの作成に失敗: {e}")
         return None
+
+def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]:
+    """S3からグループ会社設定JSONファイルを読み込む"""
+    try:
+        s3 = get_s3_client()
+        response = s3.get_object(Bucket=bucket, Key=key)
+        config_data = json.loads(response['Body'].read().decode('utf-8'))
+        print(f"✅ 設定ファイル読み込み成功: {key}")
+        return config_data
+    except Exception as e:
+        print(f"❌ 設定ファイル読み込み失敗: {e}")
+        return {}
+
+def get_company_name_from_group_id(group_id: str, config: Dict[str, Any]) -> str:
+    """グループIDから会社の正式名称を取得"""
+    group_companies = config.get("group_companies", {})
+    if group_id in group_companies:
+        return group_companies[group_id].get("name", group_id)
+    return group_id
+
+def find_all_group_csvs_in_s3(bucket: str, prefix: str) -> List[Dict[str, str]]:
+    """S3上のprefix配下からすべてのweb_reservation_*.csvファイルを返す"""
+    s3 = get_s3_client()
+    if s3 is None:
+        return []
+    
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        csv_files = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key", "")
+                if key.endswith(".csv") and "web_reservation_" in key:
+                    # ファイル名からグループIDを抽出
+                    filename = key.split('/')[-1]
+                    name_parts = filename.replace('.csv', '').split('_')
+                    # web_reservation_aoba_20250901.csv → ['web', 'reservation', 'aoba', '20250901']
+                    # グループIDは3番目の要素（インデックス2）
+                    group_id = name_parts[2] if len(name_parts) >= 3 else "unknown"
+                    
+                    csv_files.append({
+                        "bucket": bucket,
+                        "key": key,
+                        "filename": filename,
+                        "group_id": group_id,
+                        "last_modified": obj["LastModified"].isoformat()
+                    })
+        return csv_files
+    except Exception as e:
+        print(f"S3 エラー: {e}")
+        return []
 
 def download_from_s3(s3_path: str) -> str:
     """S3からファイルをダウンロード"""
@@ -216,6 +268,88 @@ def parse_date_columns(data):
         print(f"❌ 日付解析エラー: {e}")
         return None
 
+def filter_last_twelve_months_data(data: List[Dict]) -> List[Dict]:
+    """appoint_dateを基準に過去12ヶ月のデータをフィルタリング（今月は含めない）"""
+    if not data:
+        return data
+    
+    try:
+        from zoneinfo import ZoneInfo
+        JST = ZoneInfo("Asia/Tokyo")
+    except:
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+    
+    # 現在時刻をJSTで取得
+    now = datetime.now(JST)
+    
+    # 過去13ヶ月の開始日を計算（13ヶ月前の1日）
+    from dateutil.relativedelta import relativedelta
+    thirteen_months_ago = now - relativedelta(months=13)
+    thirteen_months_ago = thirteen_months_ago.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # 終了日は現在の月の1日（今月のデータは含めない）
+    end_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    print(f"🔍 フィルタリング条件: {thirteen_months_ago.strftime('%Y年%m月')} 以降、{end_date.strftime('%Y年%m月')} 未満")
+    print(f"🔍 現在時刻: {now.strftime('%Y年%m月%d日 %H:%M:%S')}")
+    print(f"🔍 開始日: {thirteen_months_ago.strftime('%Y年%m月%d日')}")
+    print(f"🔍 終了日: {end_date.strftime('%Y年%m月%d日')} (未満)")
+    
+    # デバッグ用: フィルタリング前の月別データ数を確認
+    month_counts = {}
+    for row in data:
+        appoint_date = row.get('appoint_date')
+        if not appoint_date:
+            continue
+        if isinstance(appoint_date, str):
+            dt = parse_datetime(appoint_date)
+        else:
+            dt = appoint_date
+        if dt:
+            if dt.tzinfo:
+                dt = dt.astimezone(JST)
+            else:
+                dt = dt.replace(tzinfo=JST)
+            month_key = f"{dt.year}-{dt.month:02d}"
+            month_counts[month_key] = month_counts.get(month_key, 0) + 1
+    
+    print(f"🔍 フィルタリング前の月別データ数: {month_counts}")
+    
+    filtered_data = []
+    filtered_month_counts = {}
+    for row in data:
+        # appoint_dateを取得
+        appoint_date = row.get('appoint_date')
+        if not appoint_date:
+            continue
+        
+        # 日時をパース
+        if isinstance(appoint_date, str):
+            dt = parse_datetime(appoint_date)
+            if dt is None:
+                continue
+        else:
+            dt = appoint_date
+            
+        # JSTに変換
+        if dt.tzinfo:
+            dt = dt.astimezone(JST)
+        else:
+            dt = dt.replace(tzinfo=JST)
+        
+        # 指定期間以内かチェック（13ヶ月前以降、今月未満）
+        is_in_range = dt >= thirteen_months_ago and dt < end_date
+        if is_in_range:
+            filtered_data.append(row)
+            # フィルタリング後の月別データ数をカウント
+            month_key = f"{dt.year}-{dt.month:02d}"
+            filtered_month_counts[month_key] = filtered_month_counts.get(month_key, 0) + 1
+    
+    print(f"📊 フィルタリング結果: {len(data)}件 → {len(filtered_data)}件")
+    print(f"🔍 フィルタリング後の月別データ数: {filtered_month_counts}")
+    return filtered_data
+
 def create_monthly_summary(data, site_type: str = "all"):
     """月別の初回受付・再受付の集計を作成（HP/その他別）"""
     try:
@@ -261,6 +395,7 @@ def create_monthly_summary(data, site_type: str = "all"):
             result.append(data_point)
         
         print(f"📊 {site_type}月別集計完了: {len(result)}ヶ月")
+        print(f"🔍 {site_type}集計対象月: {[data['月'] for data in result]}")
         return result
         
     except Exception as e:
@@ -304,6 +439,8 @@ def create_combined_data(hp_data, other_data):
                 '総合計': hp_month_data['合計'] + other_month_data['合計']
             })
         
+        print(f"📊 統合データ作成完了: {len(combined_data)}ヶ月")
+        print(f"🔍 統合データ対象月: {[data['月'] for data in combined_data]}")
         return combined_data
         
     except Exception as e:
@@ -911,7 +1048,7 @@ def create_combined_chart(workbook, worksheet, combined_data, sheet_name):
     except Exception as e:
         print(f"❌ {sheet_name}グラフ作成エラー: {e}")
 
-def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None) -> dict:
+def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None, group_id: str = None, company_name: str = None) -> dict:
     """CSVファイルを処理して新しい月別集計Excelファイルを作成"""
     try:
         print(f" 拡張CSVファイル処理開始: {csv_path}")
@@ -931,6 +1068,11 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
         if data is None:
             return {"success": False, "error": "日付解析に失敗"}
         
+        # 直近12ヶ月のデータをフィルタリング
+        data = filter_last_twelve_months_data(data)
+        if not data:
+            return {"success": False, "error": "直近12ヶ月のデータがありません"}
+        
         # HPとその他で月別集計
         hp_data = create_monthly_summary(data, "hp")
         other_data = create_monthly_summary(data, "other")
@@ -938,9 +1080,13 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
         if hp_data is None or other_data is None:
             return {"success": False, "error": "月別集計に失敗"}
         
-        # 新しいExcelファイルを作成
-        timestamp = datetime.now().strftime('%Y%m')
-        output_filename = f"月別集計_一年間_{timestamp}.xlsx"
+        # 新しいExcelファイルを作成（年、月、グループID対応）
+        current_date = datetime.now()
+        year_month = f"{current_date.year}_{current_date.month:02d}"
+        if group_id:
+            output_filename = f"{group_id}_{year_month}_月別集計_一年間.xlsx"
+        else:
+            output_filename = f"{year_month}_月別集計_一年間.xlsx"
         output_path = Path(f"/tmp/{output_filename}")
         
         try:
@@ -956,7 +1102,9 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
         # S3にアップロード（フラグがTrueの場合）
         s3_results = []
         if upload_to_s3_flag and s3_bucket:
-            upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
+            # 年月と会社名を含むパスを生成（reservationフォルダは作成しない）
+            company_folder = company_name or group_id 
+            upload_prefix = f"{year_month}/{company_folder}/"
             
             # 新しい月別集計ファイルをアップロード
             if output_path.exists():
@@ -989,7 +1137,7 @@ def lambda_handler(event, context):
         
         # 環境変数から設定を取得（デフォルト値を設定）
         s3_bucket = os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
-        upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
+        upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/group_year_data/')
         
         # デバッグ用: 環境変数が設定されていない場合はハードコード
         if s3_bucket == 'S3_BUCKET_NAME' or s3_bucket == 'NOT_SET':
@@ -997,7 +1145,7 @@ def lambda_handler(event, context):
             print("⚠️ デバッグ: 環境変数S3_BUCKET_NAMEが設定されていません。デフォルト値を使用します。")
         
         if upload_prefix == 'S3_UPLOAD_PREFIX' or upload_prefix == 'NOT_SET':
-            upload_prefix = 'bigquery-data/'
+            upload_prefix = 'bigquery-data/group_year_data/'
             print("⚠️ デバッグ: 環境変数S3_UPLOAD_PREFIXが設定されていません。デフォルト値を使用します。")
         
         print(f" デバッグ: 環境変数S3_BUCKET_NAME: '{os.environ.get('S3_BUCKET_NAME', 'NOT_SET')}'")
@@ -1018,88 +1166,122 @@ def lambda_handler(event, context):
         print(f" デバッグ: イベントの型: {type(event)}")
         print(f" デバッグ: イベントのキー: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
         
-        # monthly_6_usage形式の引数からS3情報を取得
-        input_s3_bucket = event.get('s3_bucket', 'monthly-report-output-group')
-        input_s3_key = event.get('s3_key', 'bigquery-data/web_reservation_leaf_20250901.csv')
+        # グループ会社設定を読み込み
+        config_key = "bigquery-data/group_companies_config.json"
+        group_config = load_group_companies_config_from_s3(s3_bucket, config_key)
         
-        print(f" デバッグ: 入力S3バケット: {input_s3_bucket}")
-        print(f" デバッグ: 入力S3キー: {input_s3_key}")
+        # 入力ファイルの取得（単一ファイルまたは複数ファイル）
+        input_files = event.get('input_files', [])
+        input_s3_bucket = event.get('s3_bucket')
+        input_s3_key = event.get('s3_key')
         
-        if not input_s3_bucket or not input_s3_key:
-            return {"statusCode": 400, "body": json.dumps({"success": False, "error": "s3_bucketまたはs3_keyが指定されていません"}, ensure_ascii=False)}
+        # 入力ファイルが指定されていない場合は、S3から自動検索
+        if not input_files and not input_s3_key:
+            print("🔍 入力ファイルが指定されていないため、S3から自動検索")
+            csv_files = find_all_group_csvs_in_s3(s3_bucket, upload_prefix)
+            if not csv_files:
+                return {"statusCode": 404, "body": json.dumps({"success": False, "error": "対象CSVファイルが見つかりません"}, ensure_ascii=False)}
+            
+            print(f"✅ {len(csv_files)}個のCSVファイルが見つかりました")
+            input_files = [f"s3://{f['bucket']}/{f['key']}" for f in csv_files]
         
-        # S3パスを構築
-        s3_path = f"s3://{input_s3_bucket}/{input_s3_key}"
-        result_data = {"bucket": input_s3_bucket, "key": input_s3_key}
+        # 単一ファイルが指定された場合
+        elif input_s3_key:
+            input_files = [f"s3://{input_s3_bucket or s3_bucket}/{input_s3_key}"]
         
-        print(f" デバッグ: 構築されたS3パス: {s3_path}")
-        print(f"🔍 デバッグ: result_data: {result_data}")
+        print(f"🔍 デバッグ: 処理対象ファイル数: {len(input_files)}")
         
         processed_files = []
         uploaded_files = []
         errors = []
         
-        # 1つのファイルを処理
-        try:
-            print(f"🔍 デバッグ: ファイル処理開始")
-            
-            # S3パスを構築
-            bucket = result_data.get('bucket', '')
-            key = result_data.get('key', '')
-            if not bucket or not key:
-                return {"statusCode": 400, "body": json.dumps({"success": False, "error": "bucketまたはkeyが指定されていません"}, ensure_ascii=False)}
-            
-            s3_path = f"s3://{bucket}/{key}"
-            
-            # 入力ファイル名をログ出力
-            print(f"📁 入力ファイルS3パス: {s3_path}")
-            if s3_path:
-                # S3パスからファイル名を抽出
+        # 各ファイルを処理
+        for i, s3_path in enumerate(input_files, 1):
+            try:
+                print(f"🔍 デバッグ: ファイル処理開始 ({i}/{len(input_files)}): {s3_path}")
+                
+                # S3パスを解析
+                if not s3_path.startswith('s3://'):
+                    print(f"⚠️ 無効なS3パス: {s3_path}")
+                    continue
+                
+                path_parts = s3_path[5:].split('/', 1)
+                if len(path_parts) != 2:
+                    print(f"⚠️ 無効なS3パス形式: {s3_path}")
+                    continue
+                
+                bucket = path_parts[0].strip()
+                key = path_parts[1].strip()
+                
+                if not bucket or not key:
+                    print(f"⚠️ 無効なバケットまたはキー: bucket={bucket}, key={key}")
+                    continue
+                
+                s3_path = f"s3://{bucket}/{key}"
+                
+                # 入力ファイル名をログ出力
+                print(f"📁 入力ファイルS3パス: {s3_path}")
                 filename = s3_path.split('/')[-1] if '/' in s3_path else s3_path
                 print(f"📄 入力ファイル名: {filename}")
-            else:
-                print("⚠️ ファイルパスが空です")
-            
-            # S3からファイルをダウンロード
-            print(f"⬇️ S3からファイルをダウンロード開始: {s3_path}")
-            print(f" デバッグ: バケット名: {input_s3_bucket}")
-            print(f"🔍 デバッグ: オブジェクトキー: {input_s3_key}")
-            local_path = download_from_s3(s3_path)
-            if not local_path:
-                error_msg = f"S3ダウンロード失敗: {s3_path}"
+                
+                # ファイル名からグループIDを抽出
+                name_parts = filename.replace('.csv', '').split('_')
+                # web_reservation_aoba_20250901.csv → ['web', 'reservation', 'aoba', '20250901']
+                # グループIDは3番目の要素（インデックス2）
+                group_id = name_parts[2] if len(name_parts) >= 3 else "unknown"
+                print(f"🏷️ グループID: {group_id}")
+                
+                # グループIDから会社の正式名称を取得
+                company_name = get_company_name_from_group_id(group_id, group_config)
+                print(f"🏢 会社名: {company_name}")
+                
+                # S3からファイルをダウンロード
+                print(f"⬇️ S3からファイルをダウンロード開始: {s3_path}")
+                local_path = download_from_s3(s3_path)
+                if not local_path:
+                    error_msg = f"S3ダウンロード失敗: {s3_path}"
+                    print(f"❌ {error_msg}")
+                    errors.append(error_msg)
+                    continue
+                
+                # ダウンロード完了ログ
+                downloaded_filename = local_path.split('/')[-1] if '/' in local_path else local_path
+                print(f"✅ S3ダウンロード完了: {downloaded_filename}")
+                
+                # 一つのファイルでHPとその他を処理
+                print(f" データ処理開始（HPとその他を一つのファイルに）")
+                
+                result = process_csv_file_enhanced(
+                    csv_path=local_path,
+                    upload_to_s3_flag=True,
+                    s3_bucket=s3_bucket,
+                    group_id=group_id,
+                    company_name=company_name
+                )
+                
+                if result.get('success'):
+                    processed_files.append(result)
+                    uploaded_files.extend(result.get('s3_uploads', []))
+                    print(f"✅ 処理完了: {result.get('message')}")
+                else:
+                    error_msg = f"処理失敗: {result.get('error')}"
+                    print(f"❌ {error_msg}")
+                    errors.append(error_msg)
+                
+                # 一時ファイルを削除
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                    print(f"🗑️ 一時ファイル削除: {local_path}")
+                
+            except Exception as e:
+                error_msg = f"ファイル処理エラー: {str(e)}"
                 print(f"❌ {error_msg}")
-                return {"statusCode": 400, "body": json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)}
-            
-            # ダウンロード完了ログ
-            downloaded_filename = local_path.split('/')[-1] if '/' in local_path else local_path
-            print(f"✅ S3ダウンロード完了: {downloaded_filename}")
-            
-            # 一つのファイルでHPとその他を処理
-            print(f" データ処理開始（HPとその他を一つのファイルに）")
-            
-            result = process_csv_file_enhanced(
-                csv_path=local_path,
-                upload_to_s3_flag=True,
-                s3_bucket=s3_bucket
-            )
-            
-            if result.get('success'):
-                processed_files.append(result)
-                uploaded_files.extend(result.get('s3_uploads', []))
-                print(f"✅ 処理完了: {result.get('message')}")
-            else:
-                error_msg = f"処理失敗: {result.get('error')}"
-                print(f"❌ {error_msg}")
-                return {"statusCode": 500, "body": json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)}
-            
-        except Exception as e:
-            error_msg = f"ファイル処理エラー: {str(e)}"
-            print(f"❌ {error_msg}")
-            return {"statusCode": 500, "body": json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)}
+                errors.append(error_msg)
         
         print(f"\n=== 処理完了サマリー ===")
         print(f"✅ 成功: {len(processed_files)} ファイル")
-        print(f"📊 合計: 1 ファイル")
+        print(f"❌ 失敗: {len(errors)} ファイル")
+        print(f"📊 合計: {len(input_files)} ファイル")
         
         # 結果を返す
         result = {

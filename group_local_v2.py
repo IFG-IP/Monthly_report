@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
@@ -29,6 +30,206 @@ API Gateway 経由でもそのまま利用可。
 
 import os, json
 import os.path as _p
+
+def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]:
+    """
+    S3からグループ会社設定JSONファイルを読み込む
+    """
+    try:
+        s3 = boto3.client('s3', region_name=AWS_REGION)
+        response = s3.get_object(Bucket=bucket, Key=key)
+        config_data = json.loads(response['Body'].read().decode('utf-8'))
+        group_count = len(config_data.get("group_companies", {}))
+        jlog("info", "Config loaded from S3", bucket=bucket, key=key, group_count=group_count)
+        return config_data
+    except Exception as e:
+        jlog("error", "Failed to load config from S3", error=str(e), bucket=bucket, key=key)
+        return {"group_companies": {}}
+
+def load_group_companies_config(config_path: str = None, s3_bucket: str = None, s3_key: str = None) -> Dict[str, Any]:
+    """
+    グループ会社設定を読み込む（S3優先、ローカルファイルはフォールバック）
+    """
+    # S3からの読み込みを優先
+    if s3_bucket and s3_key:
+        jlog("debug", "Loading config from S3", s3_bucket=s3_bucket, s3_key=s3_key)
+        return load_group_companies_config_from_s3(s3_bucket, s3_key)
+    
+    # ローカルファイルからの読み込み（開発・テスト用）
+    jlog("debug", "Checking config file", config_path=config_path, exists=os.path.exists(config_path) if config_path else False)
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                group_count = len(config_data.get("group_companies", {}))
+                jlog("info", "Config loaded from local file", path=config_path, group_count=group_count)
+                return config_data
+        except Exception as e:
+            jlog("error", "Failed to load local config file", error=str(e), path=config_path)
+    
+    # デフォルト設定を使用（現在はコメントアウト）
+    jlog("error", "No config file found", 
+         config_path=config_path, 
+         s3_bucket=s3_bucket, 
+         s3_key=s3_key,
+         local_file_exists=os.path.exists(config_path) if config_path else False)
+    return {"group_companies": {}}
+
+# def get_default_group_companies() -> Dict[str, Any]:
+#     """
+#     デフォルトのグループ会社設定を返す（あおば様とリーフ様）
+#     """
+#     return {
+#         "group_companies": {
+#             "aoba": {
+#                 "name": "株式会社あおば",
+#                 "property_numbers": [
+#                     "E10325967000001","E10325968000001","E10325969000001",
+#                     "E10325970000001","E10325971000001","E10325972000001",
+#                     "E10328768000001","E10329713000001","E10331622000001",
+#                     "E10333612000001","E10333613000001","E10334125000001",
+#                     "E10334306000001","E10334307000001","E10335046000001",
+#                     "E10335047000001","E10335430000001","E10335438000001",
+#                     "E10335991000001","E10336750000001","E10336882000001",
+#                     "E10336883000001","E10336884000001","E10337382000001",
+#                     "E10337579000001","E10338079000001","E10338080000001",
+#                     "E10338081000001","E10338728000001","E10339072000001",
+#                     "E10339069000001","E10339071000001","E10339070000001"
+#                 ]
+#             },
+#             "leaf": {
+#                 "name": "株式会社リーフ",
+#                 "property_numbers": [
+#                     "E10331193000001","E10331197000001","E10331198000001",
+#                     "E10331200000001","E10331201000001","E10337069000001",
+#                     "E10337070000001"
+#                 ]
+#             }
+#         }
+#     }
+
+def process_all_group_companies(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    s3_prefix: str = "bigquery-data/group_year_data/",
+    config_path: str = None,
+    s3_bucket: str = None,
+    s3_key: str = None
+) -> Dict[str, Any]:
+    """
+    全27グループ会社を順次処理する
+    """
+    trace_id = str(uuid.uuid4())
+    t_start = time.perf_counter()
+    
+    jlog("info", "Starting batch processing for all group companies", trace_id=trace_id)
+    
+    # 設定ファイルを読み込み（ローカルファイル優先）
+    jlog("debug", "Loading config", config_path=config_path, s3_bucket=s3_bucket, s3_key=s3_key)
+    config = load_group_companies_config(config_path, s3_bucket, s3_key)
+    group_companies = config.get("group_companies", {})
+    
+    # デバッグ: 読み込まれた設定の詳細ログ
+    jlog("info", "Loaded group companies config", 
+         total_groups=len(group_companies),
+         group_ids=list(group_companies.keys())[:10],  # 最初の10個のみ表示
+         config_source="S3" if s3_bucket and s3_key else "local" if config_path else "default")
+    
+    if len(group_companies) == 0:
+        jlog("error", "No group companies found in config", config=config)
+        return {
+            "trace_id": trace_id,
+            "success": False,
+            "error": "No group companies found in config",
+            "total_groups": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "total_rows": 0,
+            "results": []
+        }
+    
+    results = []
+    errors = []
+    total_rows = 0
+    
+    for group_id, group_info in group_companies.items():
+        try:
+            jlog("info", "Processing group company", 
+                 group_id=group_id, 
+                 company_name=group_info.get("name", "Unknown"),
+                 property_count=len(group_info.get("property_numbers", [])))
+            
+            # デバッグ: 物件番号の詳細ログ
+            property_numbers = group_info.get("property_numbers", [])
+            jlog("debug", "Property numbers for group", 
+                 group_id=group_id, 
+                 property_numbers=property_numbers[:5],  # 最初の5個のみ
+                 total_count=len(property_numbers))
+            
+            # 個別グループ会社を処理
+            result = process(
+                property_numbers=property_numbers,
+                start_date=start_date,
+                end_date=end_date,
+                s3_prefix=f"{s3_prefix.rstrip('/')}/group_year_data/",
+                trace_id=f"{trace_id}_{group_id}",
+                group_id=group_id
+            )
+            
+            # 結果を記録
+            group_result = {
+                "group_id": group_id,
+                "company_name": group_info.get("name", "Unknown"),
+                "success": True,
+                "rows": result.get("rows", 0),
+                "s3_bucket": result.get("bucket"),
+                "s3_key": result.get("key"),
+                "s3_url": result.get("url")
+            }
+            results.append(group_result)
+            total_rows += result.get("rows", 0)
+            
+            jlog("info", "Group processing completed", 
+                 group_id=group_id, 
+                 rows=result.get("rows", 0))
+            
+        except Exception as e:
+            error_msg = f"Group {group_id} processing failed: {str(e)}"
+            jlog("error", "Group processing failed", 
+                 group_id=group_id, 
+                 error=str(e))
+            
+            group_result = {
+                "group_id": group_id,
+                "company_name": group_info.get("name", "Unknown"),
+                "success": False,
+                "error": str(e)
+            }
+            results.append(group_result)
+            errors.append(error_msg)
+    
+    t_ms = round((time.perf_counter() - t_start) * 1000)
+    success_count = len([r for r in results if r.get("success", False)])
+    failed_count = len([r for r in results if not r.get("success", False)])
+    
+    jlog("info", "Batch processing completed", 
+         trace_id=trace_id,
+         total_groups=len(group_companies),
+         success_count=success_count,
+         failed_count=failed_count,
+         total_rows=total_rows,
+         ms=t_ms)
+    
+    return {
+        "trace_id": trace_id,
+        "total_groups": len(group_companies),
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "total_rows": total_rows,
+        "results": results,
+        "errors": errors,
+        "processing_time_ms": t_ms
+    }
 
 def lambda_handler(event, context):
     cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -247,16 +448,11 @@ def process(
     start_date: Optional[str],
     end_date: Optional[str],
     s3_prefix: str,
-    trace_id: str
+    trace_id: str,
+    group_id: str = "leaf"
 ) -> Dict[str, Any]:
-    # デフォルト期間（既存ロジックをそのまま）
-    if not start_date or not end_date:
-        now = datetime.now()
-        last_month_end = (now.replace(day=1) - timedelta(days=1))
-        last_month_start = last_month_end.replace(day=1)
-        one_year_ago = last_month_start - timedelta(days=365)
-        start_date = one_year_ago.strftime("%Y-%m-%d")
-        end_date = last_month_end.strftime("%Y-%m-%d")
+    # 期間はlambda_handlerで設定済み
+    jlog("debug", "process関数で受信した期間", start_date=start_date, end_date=end_date)
 
     if not property_numbers:
         property_numbers = [
@@ -272,10 +468,16 @@ def process(
             "E10338081000001","E10338728000001","E10339072000001",
             "E10339069000001","E10339071000001","E10339070000001"
         ]
-
+#物件番号は株式会社あおば様の物件番号である
+#ファイル名は株式会社リーフ様からleafをつけているため混乱しないように
+#株式会社リーフ様用の物件番号
+### if not property_numbers:
+#     property_numbers =["E10331193000001","E10331197000001","E10331198000001","E10331200000001","E10331201000001","E10337069000001","E10337070000001"]
     jlog("info", "parameters",
          trace_id=trace_id,
+         group_id=group_id,
          property_numbers_count=len(property_numbers),
+         property_numbers_sample=property_numbers[:3] if property_numbers else [],
          start_date=start_date, end_date=end_date,
          s3_bucket=S3_BUCKET_NAME,   # ← ここは常に環境変数
          s3_prefix=s3_prefix,
@@ -283,11 +485,24 @@ def process(
 
     # BigQuery
     df = query_bigquery(property_numbers, start_date, end_date)
+    
+    # デバッグ: BigQuery結果のログ
+    jlog("info", "BigQuery result", 
+         group_id=group_id,
+         rows_count=len(df) if df is not None else 0,
+         columns=df.columns.tolist() if df is not None and not df.empty else [])
 
     # CSV へ
     csv_bytes = df_to_csv_bytes(df)
-    filename = f"web_reservation_leaf_{datetime.today().replace(day=1).strftime('%Y%m%d')}.csv"
+    filename = f"web_reservation_{group_id}_{datetime.today().replace(day=1).strftime('%Y%m%d')}.csv"
     key = f"{s3_prefix.rstrip('/')}/{filename}"
+    
+    # デバッグ: ファイル名とS3キーのログ
+    jlog("info", "Generated file info", 
+         group_id=group_id,
+         filename=filename,
+         s3_key=key,
+         csv_size_bytes=len(csv_bytes))
 
     if DRY_RUN:
         jlog("warn", "DRY_RUN: skip S3 upload", key=key, bytes=len(csv_bytes), bucket=S3_BUCKET_NAME)
@@ -312,26 +527,57 @@ def lambda_handler(event, context):
     jlog("info", "lambda start", trace_id=trace_id, event=event)
 
     try:
-        # 入力取得
-        property_numbers = event.get("property_numbers") if isinstance(event, dict) else None
-        start_date = event.get("start_date") if isinstance(event, dict) else None
-        end_date = event.get("end_date") if isinstance(event, dict) else None
-        output_to_s3 = bool(event.get("output_to_s3", False)) if isinstance(event, dict) else False
-        s3_prefix = event.get("s3_prefix", "bigquery-data/") if isinstance(event, dict) else "bigquery-data/"
-
-        if not output_to_s3 and not DRY_RUN:
-            jlog("warn", "output_to_s3=false and DRY_RUN=false: S3 へは出力されません", trace_id=trace_id)
-
-        result = process(property_numbers, start_date, end_date, s3_prefix, trace_id)
-
+        # 全27グループ会社を順次処理
+        jlog("info", "Starting batch processing for all group companies", trace_id=trace_id)
+        
+        # イベントからPayloadを取得
+        payload = event.get("Payload", {}) if isinstance(event, dict) else {}
+        jlog("debug", "Event payload", payload=payload)
+        
+        # 期間を明示的に設定（常に13ヶ月前から前月まで）
+        start_date = payload.get("start_date") if isinstance(payload, dict) else None
+        end_date = payload.get("end_date") if isinstance(payload, dict) else None
+        
+        # 期間を常に13ヶ月前から前月までに設定（強制実行）
+        if True:  # 常に実行
+            from dateutil.relativedelta import relativedelta
+            now = datetime.now()
+            # 過去13ヶ月前の1日を開始日とする
+            thirteen_months_ago = now - relativedelta(months=13)
+            thirteen_months_ago = thirteen_months_ago.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            
+            # 前月の最終日を終了日とする
+            last_month_end = (now.replace(day=1) - timedelta(days=1))
+            last_month_end = last_month_end.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            start_date = thirteen_months_ago.strftime("%Y-%m-%d")
+            end_date = last_month_end.strftime("%Y-%m-%d")
+            
+            jlog("info", "Lambda期間設定（強制実行）", 
+                 start_date=start_date, 
+                 end_date=end_date,
+                 thirteen_months_ago=thirteen_months_ago.strftime("%Y-%m-%d %H:%M:%S"),
+                 last_month_end=last_month_end.strftime("%Y-%m-%d %H:%M:%S"),
+                 now=now.strftime("%Y-%m-%d %H:%M:%S"),
+                 months_diff=13)
+        s3_prefix = payload.get("s3_prefix", "bigquery-data/") if isinstance(payload, dict) else "bigquery-data/"
+        
+        # 設定ファイルの場所を指定（S3優先）
+        config_path = payload.get("config_path") if isinstance(payload, dict) else None
+        s3_bucket = payload.get("s3_bucket") if isinstance(payload, dict) else None
+        s3_key = payload.get("s3_key", "bigquery-data/group_companies_config.json") if isinstance(payload, dict) else "bigquery-data/group_companies_config.json"
+        
+        jlog("debug", "Config parameters", s3_bucket=s3_bucket, s3_key=s3_key, config_path=config_path)
+        
+        result = process_all_group_companies(start_date, end_date, s3_prefix, config_path, s3_bucket, s3_key)
+        
         t_ms = round((time.perf_counter() - t_start) * 1000)
-        jlog("info", "lambda done", trace_id=trace_id, ms=t_ms)
-        # Step Functions 用にトップレベル result を返しつつ、API 互換の body も返す
-        body = {"trace_id": trace_id, "result": result}
+        jlog("info", "batch processing done", trace_id=trace_id, ms=t_ms)
+        
         return {
             "statusCode": 200,
-            "result": result,               # ← これで $.Payload.result をそのまま参照可能
-            "body": json.dumps(body, ensure_ascii=False),
+            "result": result,
+            "body": json.dumps({"trace_id": trace_id, "result": result}, ensure_ascii=False),
         }
 
     except Exception as e:
@@ -346,13 +592,14 @@ def lambda_handler(event, context):
 
 # -------- Local test --------
 if __name__ == "__main__":
-    # ローカルテスト用
+    # ローカルテスト用（バッチ処理）
+    # 期間を指定しない場合のデフォルト動作をテスト
     test_event = {
-        "property_numbers": ["E10331191000001", "E10331193000001"],
-        "start_date": "2024-01-01",
-        "end_date": "2024-12-31",
-        "output_to_s3": True,
-        "s3_bucket": "your-bucket-name",
-        "s3_prefix": "bigquery-data/",
+        "Payload": {
+            "s3_prefix": "bigquery-data/",
+            "s3_bucket": "monthly-report-output-group",
+            "s3_key": "bigquery-data/group_companies_config.json"
+            # start_date, end_date を指定しない（デフォルト期間を使用）
+        }
     }
     print(json.dumps(lambda_handler(test_event, None), ensure_ascii=False, indent=2))

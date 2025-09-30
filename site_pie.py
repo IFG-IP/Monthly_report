@@ -3,7 +3,7 @@ import os
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 try:
     import boto3
@@ -22,6 +22,27 @@ def _get_s3_client():
 	except Exception as e:
 		print(f"S3クライアント初期化失敗: {e}")
 		return None
+
+def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]:
+	"""S3からグループ会社設定JSONファイルを読み込む"""
+	try:
+		s3 = _get_s3_client()
+		if s3 is None:
+			return {}
+		response = s3.get_object(Bucket=bucket, Key=key)
+		config_data = json.loads(response['Body'].read().decode('utf-8'))
+		print(f"✅ 設定ファイル読み込み成功: {key}")
+		return config_data
+	except Exception as e:
+		print(f"❌ 設定ファイル読み込み失敗: {e}")
+		return {}
+
+def get_company_name_from_group_id(group_id: str, config: Dict[str, Any]) -> str:
+	"""グループIDから会社の正式名称を取得"""
+	group_companies = config.get("group_companies", {})
+	if group_id in group_companies:
+		return group_companies[group_id].get("name", group_id)
+	return group_id
 
 
 
@@ -116,7 +137,7 @@ def _classify_site_code(site_code: Optional[str]) -> Optional[str]:
 	return m.get(code)
 
 
-def _add_site_pie_inplace(target_path: Path, chart_title: str = "サイト分類別割合") -> Dict:
+def _add_site_pie_inplace(target_path: Path, chart_title: str = "サイト分類別割合", group_id: str = None, company_name: str = None) -> Dict:
 	try:
 		from openpyxl import load_workbook
 		from openpyxl.chart import PieChart, Reference
@@ -190,11 +211,18 @@ def _add_site_pie_inplace(target_path: Path, chart_title: str = "サイト分類
 				continue
 
 			# このシート用のピボットシートを作成
-			ts = datetime.now().strftime("%Y%m%d%H%M%S")
+			ts = datetime.now().strftime("%Y%m")
 			pivot_name = f"ピボット_サイト分類円_{data_ws.title}_{ts}"
 			# Excelのシート名制限（31文字）に合わせる
 			if len(pivot_name) > 31:
 				pivot_name = f"サイト分類円_{data_ws.title}_{ts}"[:31]
+			
+			# 既存のシートをチェックして上書き
+			if pivot_name in wb.sheetnames:
+				print(f"    📊 既存シートを上書き: '{pivot_name}'")
+				wb.remove(wb[pivot_name])
+			
+			print(f"    📊 新しいシート作成: '{pivot_name}'")
 			pivot_ws = wb.create_sheet(title=pivot_name)
 
 			pivot_ws['A1'] = "サイト分類"
@@ -257,60 +285,44 @@ def _add_site_pie_inplace(target_path: Path, chart_title: str = "サイト分類
 
 
 def _get_target_months_from_data(data: List[Dict]) -> List[Tuple[int, int]]:
-	"""データから直近2か月の対象月を動的に取得する関数"""
-	if not data:
-		return []
-	
-	try:
-		from zoneinfo import ZoneInfo
-		JST = ZoneInfo("Asia/Tokyo")
-	except:
-		from datetime import timezone, timedelta
-		JST = timezone(timedelta(hours=9))
-	
-	# 現在時刻をJSTで取得
-	now = datetime.now(JST)
-	
-	# 直近2か月の開始日を計算（月単位で正確に）
-	current_year = now.year
-	current_month = now.month
-	
-	# 2か月前の月を計算
-	if current_month <= 2:
-		two_months_ago_year = current_year - 1
-		two_months_ago_month = current_month + 10  # 12 + (month - 2)
-	else:
-		two_months_ago_year = current_year
-		two_months_ago_month = current_month - 2
-	
-	# 2か月前の月の1日を開始日とする
-	two_months_ago = datetime(two_months_ago_year, two_months_ago_month, 1, tzinfo=JST)
-	
-	print(f"🔍 対象期間: {two_months_ago.strftime('%Y年%m月')} 以降")
-	
-	# データから実際に存在する年月を収集
-	months_found = set()
-	for row in data:
-		timestamp_str = row.get('appoint_timestamp', '')
-		if not timestamp_str:
-			continue
-			
-		dt = parse_datetime(timestamp_str)
-		if dt is None:
-			continue
-			
-		# JSTに変換
-		if dt.tzinfo:
-			dt = dt.astimezone(JST)
-		else:
-			dt = dt.replace(tzinfo=JST)
-		
-		# 2か月前の月以降のデータのみを対象
-		if dt >= two_months_ago:
-			months_found.add((dt.year, dt.month))
-	
-	# 年月でソートして返す
-	return sorted(list(months_found))
+    """直近2か月の対象月を取得する関数（7月と8月）"""
+    try:
+        from zoneinfo import ZoneInfo
+        JST = ZoneInfo("Asia/Tokyo")
+    except:
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+    
+    # 現在時刻をJSTで取得
+    now = datetime.now(JST)
+    current_year = now.year
+    current_month = now.month
+    
+    # 直近2か月を計算（7月と8月）
+    target_months = []
+    
+    # 2か月前の月（7月）
+    if current_month <= 2:
+        two_months_ago_year = current_year - 1
+        two_months_ago_month = current_month + 10  # 12 + (month - 2)
+    else:
+        two_months_ago_year = current_year
+        two_months_ago_month = current_month - 2
+    
+    # 前の月（8月）
+    if current_month == 1:
+        previous_month_year = current_year - 1
+        previous_month = 12
+    else:
+        previous_month_year = current_year
+        previous_month = current_month - 1
+    
+    # 対象月を追加（7月と8月）
+    target_months.append((two_months_ago_year, two_months_ago_month))
+    target_months.append((previous_month_year, previous_month))
+    
+    print(f"🔍 対象月: {target_months}")
+    return target_months
 
 
 def parse_datetime(date_str: str) -> Optional[datetime]:
@@ -363,60 +375,43 @@ def load_csv_from_s3(bucket: str, key: str) -> Optional[List[Dict]]:
 
 
 def _list_last_two_months_others(s3, bucket: str, prefix: str) -> List[Dict[str, str]]:
-	"""直近2か月分の統合データファイルを検索する関数"""
-	# まずCSVファイルから直近2か月のデータを取得して対象月を決定
-	try:
-		# 最新のCSVファイルを取得
-		paginator = s3.get_paginator("list_objects_v2")
-		latest_csv = None
-		for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-			for obj in page.get("Contents", []):
-				key = obj.get("Key", "")
-				if key.endswith(".csv") and "web_reservation_leaf_" in key:
-					if latest_csv is None or obj["LastModified"] > latest_csv["LastModified"]:
-						latest_csv = obj
-		
-		if latest_csv is None:
-			print("⚠️ CSVファイルが見つかりませんでした")
-			return []
-		
-		# CSVファイルを読み込んで対象月を取得
-		print(f"🔍 CSVファイルから対象月を取得中: {latest_csv['Key']}")
-		csv_data = load_csv_from_s3(bucket, latest_csv['Key'])
-		if not csv_data:
-			print("⚠️ CSVファイルの読み込みに失敗しました")
-			return []
-		
-		# 直近2か月の対象月を取得
-		target_months = _get_target_months_from_data(csv_data)
-		if not target_months:
-			print("⚠️ 直近2か月のデータが見つかりませんでした")
-			return []
-		
-		print(f"🔍 対象月: {target_months}")
-		
-	except Exception as e:
-		print(f"⚠️ CSVファイルからの対象月取得に失敗: {e}")
-		# フォールバック: 固定で5月・6月を使用
-		target_months = [(2025, 5), (2025, 6)]
-		print(f"🔍 フォールバック: 固定月を使用 {target_months}")
+	"""直近2か月分の統合データファイルを検索する関数（複数グループ会社対応）"""
+	# 直近2か月の対象月を取得（7月と8月）
+	target_months = _get_target_months_from_data([])
+	print(f"🔍 対象月: {target_months}")
 	
-	# 統合データファイルを検索
-	pattern = re.compile(r"(\d+)月_統合データ\.xlsx$")
-	paginator = s3.get_paginator("list_objects_v2")
+	# 統合データファイルを検索（グループID対応）
+	pattern = re.compile(r"(?:(\w+)_)?(\d+)月_統合データ\.xlsx$")
 	by_month: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
 	
-	for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+	# 現在の月のフォルダ内で検索（2025_09/）
+	from datetime import datetime
+	current_date = datetime.now()
+	current_year_month = f"{current_date.year}_{current_date.month:02d}"
+	current_prefix = f"{current_year_month}/"
+	print(f"🔍 検索中: {current_prefix}")
+	
+	for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=current_prefix):
 		for obj in page.get("Contents", []):
 			key = obj["Key"]
 			name = key.split("/")[-1]
 			m = pattern.search(name)
 			if m:
-				month = int(m.group(1))
-				# 対象月に含まれるかチェック
-				for year, target_month in target_months:
-					if month == target_month:
-						by_month.setdefault((year, month), []).append({"bucket": bucket, "key": key, "name": name})
+				group_id = m.group(1)  # グループID（オプション）
+				month_num = int(m.group(2))
+				
+				# 対象月に含まれるかチェック（7月と8月）
+				for year, month in target_months:
+					if month_num == month:
+						file_info = {
+							"bucket": bucket, 
+							"key": key, 
+							"name": name,
+							"group_id": group_id,
+							"s3_path": f"s3://{bucket}/{key}"
+						}
+						by_month.setdefault((year, month), []).append(file_info)
+						print(f"  ✅ 発見: {name} (グループ: {group_id})")
 						break
 	
 	if not by_month:
@@ -443,10 +438,40 @@ def lambda_handler(event, context):
 		
 		# 環境変数から取得、なければデフォルト値を設定
 		s3_bucket = os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
-		s3_prefix = os.environ.get('S3_OUTPUT_PREFIX', 'bigquery-data/')
-		upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', 'bigquery-data/')
+		# 直近2か月の年月を動的に生成（7月と8月）
+		from datetime import datetime
+		current_date = datetime.now()
+		current_year = current_date.year
+		current_month = current_date.month
+		
+		# 2か月前の月を計算（7月と8月）
+		if current_month <= 2:
+			two_months_ago_year = current_year - 1
+			two_months_ago_month = current_month + 10  # 12 + (month - 2)
+		else:
+			two_months_ago_year = current_year
+			two_months_ago_month = current_month - 2
+		
+		# 前の月を計算
+		if current_month == 1:
+			previous_month_year = current_year - 1
+			previous_month = 12
+		else:
+			previous_month_year = current_year
+			previous_month = current_month - 1
+		
+		# 直近2か月のフォルダを検索対象とする（7月と8月）
+		two_months_ago_year_month = f"{two_months_ago_year}_{two_months_ago_month:02d}"
+		previous_year_month = f"{previous_month_year}_{previous_month:02d}"
+		
+		s3_prefix = os.environ.get('S3_OUTPUT_PREFIX', f'{two_months_ago_year_month}/')
+		upload_prefix = os.environ.get('S3_UPLOAD_PREFIX', f'{previous_year_month}/')
 		chart_title = (event or {}).get("chart_title", "サイト分類別割合")
 		chart_style = (event or {}).get("chart_style", "vibrant")
+		
+		# グループ会社設定を読み込み
+		config_key = "bigquery-data/group_companies_config.json"
+		group_config = load_group_companies_config_from_s3(s3_bucket, config_key)
 		
 		if not s3_bucket:
 			return {
@@ -522,45 +547,84 @@ def lambda_handler(event, context):
 
 		print(f"🔍 デバッグ: 処理対象ファイル数: {len(files_to_process)}")
 		
-		# 各ファイルを処理
+		# グループID別にファイルを分類
+		group_files = {}
+		for file_info in files_to_process:
+			filename = file_info['filename']
+			# ファイル名からグループIDを抽出 (例: aoba_11月_統合データ.xlsx)
+			name_parts = filename.replace('.xlsx', '').split('_')
+			if len(name_parts) >= 2:
+				group_id = name_parts[0]
+				if group_id not in group_files:
+					group_files[group_id] = []
+				group_files[group_id].append(file_info)
+			else:
+				# グループIDがない場合は"default"として処理
+				if "default" not in group_files:
+					group_files["default"] = []
+				group_files["default"].append(file_info)
+		
+		print(f"📁 グループ別ファイル: {[(group, [f['filename'] for f in files]) for group, files in group_files.items()]}")
+		
+		# 各グループのファイルを処理
 		processed_files = []
 		output_files = []
 		errors = []
 		
-		for file_info in files_to_process:
-			try:
-				print(f"🔍 デバッグ: 処理中: {file_info['s3_path']}")
-				
-				# ファイルをダウンロード
-				local_path = Path("/tmp") / file_info['filename']
-				s3.download_file(file_info['bucket'], file_info['key'], str(local_path))
-				print(f"🔍 デバッグ: ダウンロード成功: {local_path}")
-				
-				# グラフを追加
-				print(f"🎯 グラフ作成開始: {file_info['filename']}")
-				result = _add_site_pie_inplace(local_path, chart_title)
-				
-				if result.get('success'):
-					print(f"✅ グラフ作成完了: {result.get('message', '')}")
-					processed_files.append(file_info['s3_path'])
+		for group_id, files in group_files.items():
+			print(f"\n=== グループ {group_id} の処理 ===")
+			
+			# グループIDから会社の正式名称を取得
+			company_name = get_company_name_from_group_id(group_id, group_config)
+			print(f"🏢 会社名: {company_name}")
+			
+			for i, file_info in enumerate(files, 1):
+				try:
+					print(f"🔍 デバッグ: 処理中 ({i}/{len(files)}): {file_info['s3_path']}")
 					
-					# 同じファイルをS3に上書き保存
-					s3.upload_file(str(local_path), s3_bucket, file_info['key'])
+					# ファイルをダウンロード
+					local_path = Path("/tmp") / file_info['filename']
+					s3.download_file(file_info['bucket'], file_info['key'], str(local_path))
+					print(f"🔍 デバッグ: ダウンロード成功: {local_path}")
 					
-					output_path = f"s3://{s3_bucket}/{file_info['key']}"
-					output_files.append(output_path)
-					print(f"✅ S3上書き保存成功: {output_path}")
-				else:
-					error_msg = f"グラフ作成失敗: {result.get('error', '')}"
+					# グラフを追加
+					print(f"🎯 グラフ作成開始: {file_info['filename']}")
+					result = _add_site_pie_inplace(local_path, chart_title, group_id, company_name)
+					
+					if result.get('success'):
+						print(f"✅ グラフ作成完了: {result.get('message', '')}")
+						processed_files.append(file_info['s3_path'])
+						
+						# 年月と会社名を含むパスで保存
+						from datetime import datetime
+						current_date = datetime.now()
+						year_month = f"{current_date.year}_{current_date.month:02d}"
+						company_folder = company_name or group_id or "unknown"
+						new_prefix = f"{year_month}/{company_folder}/"
+						
+						# ファイル名を新しいパスで保存
+						filename = file_info['key'].split('/')[-1]
+						new_key = f"{new_prefix}{filename}"
+						s3.upload_file(str(local_path), s3_bucket, new_key)
+						
+						output_path = f"s3://{s3_bucket}/{new_key}"
+						output_files.append(output_path)
+						print(f"✅ S3保存成功: {output_path}")
+					else:
+						error_msg = f"グラフ作成失敗: {result.get('error', '')}"
+						print(f"❌ {error_msg}")
+						errors.append(f"{file_info['s3_path']}: {error_msg}")
+					
+					# 一時ファイルを削除
+					if local_path.exists():
+						local_path.unlink()
+						
+				except Exception as e:
+					error_msg = f"ファイル処理に失敗: {file_info['s3_path']} - {str(e)}"
 					print(f"❌ {error_msg}")
 					errors.append(error_msg)
-					
-			except Exception as e:
-				error_msg = f"ファイル処理に失敗: {file_info['s3_path']} - {str(e)}"
-				print(f"❌ {error_msg}")
-				errors.append(error_msg)
-				import traceback
-				print(f"🔍 デバッグ: エラー詳細: {traceback.format_exc()}")
+					import traceback
+					print(f"🔍 デバッグ: エラー詳細: {traceback.format_exc()}")
 
 		print(f"🔍 デバッグ: 最終結果 - 処理済み: {len(processed_files)}, 出力: {len(output_files)}, エラー: {len(errors)}")
 		
@@ -572,7 +636,7 @@ def lambda_handler(event, context):
 			"output_files": output_files,
 			"count": len(processed_files),
 			"errors": errors,
-			"timestamp": datetime.now().strftime("%Y%m%d%H%M%S")
+			"timestamp": datetime.now().strftime("%Y%m")
 		}
 		
 		print(f"🔍 デバッグ: レスポンス: {response}")
