@@ -641,8 +641,8 @@ def _process_single_file(data: List[Dict], s3_bucket: str, output_to_s3: bool, i
         # デバッグログ: 会社名の取得状況を確認
         print(f"🔍 デバッグ: group_id={group_id}, company_name={company_name}")
         
-        # 会社の正式名称を優先してフォルダ名を決定
-        company_folder = company_name or group_id or "unknown"
+        # 会社の正式名称をフォルダ名として使用
+        company_folder = company_name or "unknown"
         print(f"🔍 デバッグ: 決定されたフォルダ名={company_folder}")
         
         prefix = f"{year_month}/{company_folder}/"
