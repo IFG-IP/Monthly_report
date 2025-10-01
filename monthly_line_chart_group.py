@@ -47,12 +47,7 @@ def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]
         print(f"❌ 設定ファイル読み込み失敗: {e}")
         return {}
 
-def get_company_name_from_group_id(group_id: str, config: Dict[str, Any]) -> str:
-    """グループIDから会社の正式名称を取得"""
-    group_companies = config.get("group_companies", {})
-    if group_id in group_companies:
-        return group_companies[group_id].get("name", group_id)
-    return group_id
+
 
 def find_all_group_csvs_in_s3(bucket: str, prefix: str) -> List[Dict[str, str]]:
     """S3上のprefix配下からすべてのweb_reservation_*.csvファイルを返す"""
@@ -67,18 +62,22 @@ def find_all_group_csvs_in_s3(bucket: str, prefix: str) -> List[Dict[str, str]]:
             for obj in page.get("Contents", []):
                 key = obj.get("Key", "")
                 if key.endswith(".csv") and "web_reservation_" in key:
-                    # ファイル名からグループIDを抽出
+                    # ファイル名から会社名を抽出
                     filename = key.split('/')[-1]
-                    name_parts = filename.replace('.csv', '').split('_')
-                    # web_reservation_aoba_20250901.csv → ['web', 'reservation', 'aoba', '20250901']
-                    # グループIDは3番目の要素（インデックス2）
-                    group_id = name_parts[2] if len(name_parts) >= 3 else "unknown"
+                    # web_reservation_ヒューマンアジャストグループ_20250901.csv の形式
+                    # web_reservation_ を除去して、日付部分（8桁の数字）を除外
+                    name_without_prefix = filename.replace('web_reservation_', '').replace('.csv', '')
+                    parts = name_without_prefix.split('_')
+                    if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) == 8:
+                        company_name = '_'.join(parts[:-1])  # 日付部分を除外
+                    else:
+                        company_name = parts[0] if parts else "unknown"
                     
                     csv_files.append({
                         "bucket": bucket,
                         "key": key,
                         "filename": filename,
-                        "group_id": group_id,
+                        "company_name": company_name,
                         "last_modified": obj["LastModified"].isoformat()
                     })
         return csv_files
@@ -1048,7 +1047,7 @@ def create_combined_chart(workbook, worksheet, combined_data, sheet_name):
     except Exception as e:
         print(f"❌ {sheet_name}グラフ作成エラー: {e}")
 
-def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None, group_id: str = None, company_name: str = None) -> dict:
+def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3_bucket: str = None, company_name: str = None) -> dict:
     """CSVファイルを処理して新しい月別集計Excelファイルを作成"""
     try:
         print(f" 拡張CSVファイル処理開始: {csv_path}")
@@ -1083,10 +1082,7 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
         # 新しいExcelファイルを作成（年、月、グループID対応）
         current_date = datetime.now()
         year_month = f"{current_date.year}_{current_date.month:02d}"
-        if group_id:
-            output_filename = f"{group_id}_{year_month}_月別集計_一年間.xlsx"
-        else:
-            output_filename = f"{year_month}_月別集計_一年間.xlsx"
+        output_filename = f"{year_month}_月別集計_一年間.xlsx"
         output_path = Path(f"/tmp/{output_filename}")
         
         try:
@@ -1103,7 +1099,7 @@ def process_csv_file_enhanced(csv_path: str, upload_to_s3_flag: bool = False, s3
         s3_results = []
         if upload_to_s3_flag and s3_bucket:
             # 年月と会社名を含むパスを生成（reservationフォルダは作成しない）
-            company_folder = company_name or group_id 
+            company_folder = company_name or "unknown"
             upload_prefix = f"{year_month}/{company_folder}/"
             
             # 新しい月別集計ファイルをアップロード
@@ -1166,9 +1162,6 @@ def lambda_handler(event, context):
         print(f" デバッグ: イベントの型: {type(event)}")
         print(f" デバッグ: イベントのキー: {list(event.keys()) if isinstance(event, dict) else 'Not a dict'}")
         
-        # グループ会社設定を読み込み
-        config_key = "bigquery-data/group_companies_config.json"
-        group_config = load_group_companies_config_from_s3(s3_bucket, config_key)
         
         # 入力ファイルの取得（単一ファイルまたは複数ファイル）
         input_files = event.get('input_files', [])
@@ -1224,15 +1217,15 @@ def lambda_handler(event, context):
                 filename = s3_path.split('/')[-1] if '/' in s3_path else s3_path
                 print(f"📄 入力ファイル名: {filename}")
                 
-                # ファイル名からグループIDを抽出
-                name_parts = filename.replace('.csv', '').split('_')
-                # web_reservation_aoba_20250901.csv → ['web', 'reservation', 'aoba', '20250901']
-                # グループIDは3番目の要素（インデックス2）
-                group_id = name_parts[2] if len(name_parts) >= 3 else "unknown"
-                print(f"🏷️ グループID: {group_id}")
-                
-                # グループIDから会社の正式名称を取得
-                company_name = get_company_name_from_group_id(group_id, group_config)
+                # ファイル名から会社名を直接抽出
+                # web_reservation_ヒューマンアジャストグループ_20250901.csv の形式
+                # web_reservation_ を除去して、日付部分（8桁の数字）を除外
+                name_without_prefix = filename.replace('web_reservation_', '').replace('.csv', '')
+                parts = name_without_prefix.split('_')
+                if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) == 8:
+                    company_name = '_'.join(parts[:-1])  # 日付部分を除外
+                else:
+                    company_name = parts[0] if parts else "unknown"
                 print(f"🏢 会社名: {company_name}")
                 
                 # S3からファイルをダウンロード
@@ -1255,7 +1248,6 @@ def lambda_handler(event, context):
                     csv_path=local_path,
                     upload_to_s3_flag=True,
                     s3_bucket=s3_bucket,
-                    group_id=group_id,
                     company_name=company_name
                 )
                 

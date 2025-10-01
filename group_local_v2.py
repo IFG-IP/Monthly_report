@@ -31,6 +31,8 @@ API Gateway 経由でもそのまま利用可。
 import os, json
 import os.path as _p
 
+
+
 def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]:
     """
     S3からグループ会社設定JSONファイルを読み込む
@@ -154,15 +156,17 @@ def process_all_group_companies(
     
     for group_id, group_info in group_companies.items():
         try:
-            jlog("info", "Processing group company", 
-                 group_id=group_id, 
-                 company_name=group_info.get("name", "Unknown"),
+            # グループIDから会社の正式名称を取得
+            company_name = group_info.get("name", group_id)
+            
+            jlog("info", "Processing company", 
+                 company_name=company_name, 
                  property_count=len(group_info.get("property_numbers", [])))
             
             # デバッグ: 物件番号の詳細ログ
             property_numbers = group_info.get("property_numbers", [])
-            jlog("debug", "Property numbers for group", 
-                 group_id=group_id, 
+            jlog("debug", "Property numbers for company", 
+                 company_name=company_name,
                  property_numbers=property_numbers[:5],  # 最初の5個のみ
                  total_count=len(property_numbers))
             
@@ -173,13 +177,13 @@ def process_all_group_companies(
                 end_date=end_date,
                 s3_prefix=f"{s3_prefix.rstrip('/')}/group_year_data/",
                 trace_id=f"{trace_id}_{group_id}",
-                group_id=group_id
+                company_name=company_name
             )
             
             # 結果を記録
             group_result = {
-                "group_id": group_id,
-                "company_name": group_info.get("name", "Unknown"),
+                "company_name": company_name,
+                "group_id": group_id,  # デバッグ用に残す
                 "success": True,
                 "rows": result.get("rows", 0),
                 "s3_bucket": result.get("bucket"),
@@ -189,19 +193,19 @@ def process_all_group_companies(
             results.append(group_result)
             total_rows += result.get("rows", 0)
             
-            jlog("info", "Group processing completed", 
-                 group_id=group_id, 
+            jlog("info", "Company processing completed", 
+                 company_name=company_name, 
                  rows=result.get("rows", 0))
             
         except Exception as e:
-            error_msg = f"Group {group_id} processing failed: {str(e)}"
-            jlog("error", "Group processing failed", 
-                 group_id=group_id, 
+            error_msg = f"Company {company_name} processing failed: {str(e)}"
+            jlog("error", "Company processing failed", 
+                 company_name=company_name,
                  error=str(e))
             
             group_result = {
-                "group_id": group_id,
-                "company_name": group_info.get("name", "Unknown"),
+                "company_name": company_name,
+                "group_id": group_id,  # デバッグ用に残す
                 "success": False,
                 "error": str(e)
             }
@@ -214,7 +218,7 @@ def process_all_group_companies(
     
     jlog("info", "Batch processing completed", 
          trace_id=trace_id,
-         total_groups=len(group_companies),
+         total_companies=len(group_companies),
          success_count=success_count,
          failed_count=failed_count,
          total_rows=total_rows,
@@ -222,7 +226,7 @@ def process_all_group_companies(
     
     return {
         "trace_id": trace_id,
-        "total_groups": len(group_companies),
+        "total_companies": len(group_companies),
         "success_count": success_count,
         "failed_count": failed_count,
         "total_rows": total_rows,
@@ -449,33 +453,16 @@ def process(
     end_date: Optional[str],
     s3_prefix: str,
     trace_id: str,
-    group_id: str = "leaf"
+    company_name: str = None
 ) -> Dict[str, Any]:
     # 期間はlambda_handlerで設定済み
     jlog("debug", "process関数で受信した期間", start_date=start_date, end_date=end_date)
 
     if not property_numbers:
-        property_numbers = [
-            "E10325967000001","E10325968000001","E10325969000001",
-            "E10325970000001","E10325971000001","E10325972000001",
-            "E10328768000001","E10329713000001","E10331622000001",
-            "E10333612000001","E10333613000001","E10334125000001",
-            "E10334306000001","E10334307000001","E10335046000001",
-            "E10335047000001","E10335430000001","E10335438000001",
-            "E10335991000001","E10336750000001","E10336882000001",
-            "E10336883000001","E10336884000001","E10337382000001",
-            "E10337579000001","E10338079000001","E10338080000001",
-            "E10338081000001","E10338728000001","E10339072000001",
-            "E10339069000001","E10339071000001","E10339070000001"
-        ]
-#物件番号は株式会社あおば様の物件番号である
-#ファイル名は株式会社リーフ様からleafをつけているため混乱しないように
-#株式会社リーフ様用の物件番号
-### if not property_numbers:
-#     property_numbers =["E10331193000001","E10331197000001","E10331198000001","E10331200000001","E10331201000001","E10337069000001","E10337070000001"]
+        return {"success": False, "error": "property_numbersが指定されていません"}
     jlog("info", "parameters",
          trace_id=trace_id,
-         group_id=group_id,
+         company_name=company_name,
          property_numbers_count=len(property_numbers),
          property_numbers_sample=property_numbers[:3] if property_numbers else [],
          start_date=start_date, end_date=end_date,
@@ -488,18 +475,23 @@ def process(
     
     # デバッグ: BigQuery結果のログ
     jlog("info", "BigQuery result", 
-         group_id=group_id,
+         company_name=company_name,
          rows_count=len(df) if df is not None else 0,
          columns=df.columns.tolist() if df is not None and not df.empty else [])
 
     # CSV へ
     csv_bytes = df_to_csv_bytes(df)
-    filename = f"web_reservation_{group_id}_{datetime.today().replace(day=1).strftime('%Y%m%d')}.csv"
-    key = f"{s3_prefix.rstrip('/')}/{filename}"
+    # 会社名を使用してファイル名を生成
+    company_name_for_file = company_name or "unknown"
+    filename = f"web_reservation_{company_name_for_file}_{datetime.today().replace(day=1).strftime('%Y%m%d')}.csv"
+    
+    # S3キーに会社名フォルダを含める
+    year_month = f"{datetime.today().year}_{datetime.today().month:02d}"
+    key = f"{s3_prefix.rstrip('/')}/{year_month}/{company_name_for_file}/{filename}"
     
     # デバッグ: ファイル名とS3キーのログ
     jlog("info", "Generated file info", 
-         group_id=group_id,
+         company_name=company_name,
          filename=filename,
          s3_key=key,
          csv_size_bytes=len(csv_bytes))

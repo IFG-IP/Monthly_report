@@ -30,12 +30,7 @@ def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]
         print(f"❌ 設定ファイル読み込み失敗: {e}")
         return {}
 
-def get_company_name_from_group_id(group_id: str, config: Dict[str, Any]) -> str:
-    """グループIDから会社の正式名称を取得"""
-    group_companies = config.get("group_companies", {})
-    if group_id in group_companies:
-        return group_companies[group_id].get("name", group_id)
-    return group_id
+
 
 
 def find_all_group_csvs_in_s3(bucket: str, prefix: str) -> List[Tuple[str, str]]:
@@ -146,8 +141,8 @@ def get_datetime_series(data: List[Dict]) -> List[Optional[datetime]]:
     raise ValueError("日時列が見つからない")
 
 
-def filter_last_two_months_data(data: List[Dict]) -> List[Dict]:
-    """appoint_timestampを基準に直近2か月のデータをフィルタリング（7月と8月）"""
+def filter_last_one_month_data(data: List[Dict]) -> List[Dict]:
+    """appoint_timestampを基準に直近1か月のデータをフィルタリング（前月）"""
     if not data:
         return data
     
@@ -161,22 +156,22 @@ def filter_last_two_months_data(data: List[Dict]) -> List[Dict]:
     # 現在時刻をJSTで取得
     now = datetime.now(JST)
     
-    # 直近2か月の開始日を計算（7月と8月）
+    # 直近1か月の開始日を計算（前月）
     current_year = now.year
     current_month = now.month
     
-    # 2か月前の月（7月）を計算
-    if current_month <= 2:
-        two_months_ago_year = current_year - 1
-        two_months_ago_month = current_month + 10  # 12 + (month - 2)
+    # 前月を計算
+    if current_month == 1:
+        previous_month_year = current_year - 1
+        previous_month = 12
     else:
-        two_months_ago_year = current_year
-        two_months_ago_month = current_month - 2
+        previous_month_year = current_year
+        previous_month = current_month - 1
     
-    # 2か月前の月の1日を開始日とする
-    two_months_ago = datetime(two_months_ago_year, two_months_ago_month, 1, tzinfo=JST)
+    # 前月の1日を開始日とする
+    previous_month_start = datetime(previous_month_year, previous_month, 1, tzinfo=JST)
     
-    print(f"🔍 フィルタリング条件: {two_months_ago.strftime('%Y年%m月')} 以降")
+    print(f"🔍 フィルタリング条件: {previous_month_start.strftime('%Y年%m月')} 以降")
     
     filtered_data = []
     for row in data:
@@ -196,8 +191,8 @@ def filter_last_two_months_data(data: List[Dict]) -> List[Dict]:
         else:
             dt = dt.replace(tzinfo=JST)
         
-        # 2か月以内かチェック
-        if dt >= two_months_ago:
+        # 前月以降かチェック
+        if dt >= previous_month_start:
             filtered_data.append(row)
     
     print(f"📊 フィルタリング結果: {len(data)}件 → {len(filtered_data)}件")
@@ -324,7 +319,7 @@ def add_charts_to_excel(excel_path: Path) -> Dict:
 
 
 def _get_target_months(data: List[Dict]) -> List[Tuple[int, int]]:
-    """直近２か月の対象月を取得する共通関数（7月と8月）"""
+    """直近1か月の対象月を取得する共通関数（前月）"""
     try:
         from zoneinfo import ZoneInfo
         JST = ZoneInfo("Asia/Tokyo")
@@ -337,18 +332,10 @@ def _get_target_months(data: List[Dict]) -> List[Tuple[int, int]]:
     current_year = now.year
     current_month = now.month
     
-    # 直近2か月を計算（7月と8月）
+    # 直近1か月を計算（前月）
     target_months = []
     
-    # 2か月前の月（7月）
-    if current_month <= 2:
-        two_months_ago_year = current_year - 1
-        two_months_ago_month = current_month + 10  # 12 + (month - 2)
-    else:
-        two_months_ago_year = current_year
-        two_months_ago_month = current_month - 2
-    
-    # 前の月（8月）
+    # 前月を計算
     if current_month == 1:
         previous_month_year = current_year - 1
         previous_month = 12
@@ -356,15 +343,14 @@ def _get_target_months(data: List[Dict]) -> List[Tuple[int, int]]:
         previous_month_year = current_year
         previous_month = current_month - 1
     
-    # 対象月を追加（7月と8月）
-    target_months.append((two_months_ago_year, two_months_ago_month))
+    # 対象月を追加（前月）
     target_months.append((previous_month_year, previous_month))
     
     print(f"🔍 対象月: {[(year, month) for year, month in target_months]}")
     return target_months
 
 
-def _generate_outputs(data: List[Dict], results_dir: Path, group_id: str = None) -> List[Path]:
+def _generate_outputs(data: List[Dict], results_dir: Path, company_name: str = None) -> List[Path]:
     # outputs を最初に初期化
     outputs: List[Path] = []
 
@@ -446,10 +432,7 @@ def _generate_outputs(data: List[Dict], results_dir: Path, group_id: str = None)
             grouped_data.setdefault(category, []).append(row)
 
         # 月ごとに1つのExcelファイルを作成
-        if group_id:
-            filename = f"{group_id}_{month_name}_統合データ.xlsx"
-        else:
-            filename = f"{month_name}_統合データ.xlsx"
+        filename = f"{month_name}_統合データ.xlsx"
         out_path = results_dir / filename
         
         # 新しいワークブックを作成
@@ -518,9 +501,6 @@ def process_monthly_usage(
 ) -> dict:
     """S3 から CSV を読み込み、Excel を bigquery-data/ に出力する処理"""
 
-    # グループ会社設定を読み込み
-    config_key = "bigquery-data/group_companies_config.json"
-    group_config = load_group_companies_config_from_s3(s3_bucket, config_key)
 
     data: Optional[List[Dict]] = None
     input_desc = ""
@@ -535,20 +515,20 @@ def process_monthly_usage(
         print(f"📊 指定ファイル読み込み完了: {len(data)} 件")
         print(f"📁 入力: {s3_key}")
         
-        # ファイル名からグループIDを抽出
+        
+        # ファイル名から会社名を直接抽出
         filename = s3_key.split('/')[-1].replace('web_reservation_', '').replace('.csv', '')
-        # 日付部分（8桁の数字）を除外してグループIDを取得
-        # 例: humanadjust_20250901 -> humanadjust
-        # 例: human_adjust_20250901 -> human_adjust
+        # 日付部分（8桁の数字）を除外して会社名を取得
+        # 例: ヒューマンアジャストグループ_20250901 -> ヒューマンアジャストグループ
         parts = filename.split('_')
         if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) == 8:
-            group_id = '_'.join(parts[:-1])  # 日付部分を除外
+            company_name = '_'.join(parts[:-1])  # 日付部分を除外
         else:
-            group_id = parts[0] if parts else "unknown"  # フォールバック
-        company_name = get_company_name_from_group_id(group_id, group_config)
-        print(f"🔍 デバッグ: ファイル名={filename}, group_id={group_id}, company_name={company_name}")
+            company_name = parts[0] if parts else "unknown"  # フォールバック
         
-        return _process_single_file(data, s3_bucket, output_to_s3, s3_key, group_id, company_name)
+        print(f"🔍 デバッグ: ファイル名={filename}, company_name={company_name}")
+        
+        return _process_single_file(data, s3_bucket, output_to_s3, s3_key, company_name)
     else:
         # フォルダ内のすべてのファイルを処理
         prefix = s3_input_prefix or "bigquery-data/group_year_data/"
@@ -573,22 +553,21 @@ def process_monthly_usage(
                 })
                 continue
             
-            # ファイル名からグループIDを抽出
+            # ファイル名から会社名を直接抽出
             filename = key.split('/')[-1].replace('web_reservation_', '').replace('.csv', '')
-            # 日付部分（8桁の数字）を除外してグループIDを取得
-            # 例: humanadjust_20250901 -> humanadjust
-            # 例: human_adjust_20250901 -> human_adjust
+            # 日付部分（8桁の数字）を除外して会社名を取得
+            # 例: ヒューマンアジャストグループ_20250901 -> ヒューマンアジャストグループ
             parts = filename.split('_')
             if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) == 8:
-                group_id = '_'.join(parts[:-1])  # 日付部分を除外
+                company_name = '_'.join(parts[:-1])  # 日付部分を除外
             else:
-                group_id = parts[0]  # フォールバック
-            company_name = get_company_name_from_group_id(group_id, group_config)
-            print(f"🔍 デバッグ: ファイル名={key}, group_id={group_id}, company_name={company_name}")
+                company_name = parts[0] if parts else "unknown"  # フォールバック
             
-            result = _process_single_file(data, s3_bucket, output_to_s3, key, group_id, company_name)
+            print(f"🔍 デバッグ: ファイル名={key}, company_name={company_name}")
+            
+            result = _process_single_file(data, s3_bucket, output_to_s3, key, company_name)
             result["file"] = key
-            result["group_id"] = group_id
+            result["company_name"] = company_name
             results.append(result)
         
         # 結果を集計
@@ -604,25 +583,25 @@ def process_monthly_usage(
             "message": f"バッチ処理完了: {success_count}/{total_count} ファイル成功"
         }
 
-def _process_single_file(data: List[Dict], s3_bucket: str, output_to_s3: bool, input_file: str, group_id: str = None, company_name: str = None) -> dict:
+def _process_single_file(data: List[Dict], s3_bucket: str, output_to_s3: bool, input_file: str, company_name: str = None) -> dict:
     """単一ファイルの処理"""
     print(f"📊 データ読み込み完了: {len(data)} 件")
 
-    # 直近2か月のデータをフィルタリング
-    filtered_data = filter_last_two_months_data(data)
-    print(f"📅 直近2か月データ: {len(filtered_data)} 件")
+    # 直近1か月のデータをフィルタリング
+    filtered_data = filter_last_one_month_data(data)
+    print(f"📅 直近1か月データ: {len(filtered_data)} 件")
 
     if not filtered_data:
-        return {"success": False, "error": "直近2か月のデータがありません"}
+        return {"success": False, "error": "直近1か月のデータがありません"}
 
     # 出力先: Lambda なら /tmp、ローカルなら bigquery-data/
     out_dir = Path("/tmp" if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else "bigquery-data/")
-    if group_id:
-        out_dir = out_dir / group_id
+    if company_name:
+        out_dir = out_dir / company_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        outputs = _generate_outputs(filtered_data, out_dir, group_id)
+        outputs = _generate_outputs(filtered_data, out_dir, company_name)
         print(f"📁 出力ファイル: {len(outputs)} 件")
     except Exception as e:
         return {"success": False, "error": f"出力生成でエラー: {e}"}
@@ -634,12 +613,12 @@ def _process_single_file(data: List[Dict], s3_bucket: str, output_to_s3: bool, i
         if s3 is None:
             return {"success": False, "error": "boto3が利用できません"}
         
-        # 年月と会社名を含むパスを生成（現在の月のフォルダに直近2か月のデータを配置）
+        # 年月と会社名を含むパスを生成（現在の月のフォルダに直近1か月のデータを配置）
         current_date = datetime.now()
         year_month = f"{current_date.year}_{current_date.month:02d}"
         
         # デバッグログ: 会社名の取得状況を確認
-        print(f"🔍 デバッグ: group_id={group_id}, company_name={company_name}")
+        print(f"🔍 デバッグ: company_name={company_name}")
         
         # 会社の正式名称をフォルダ名として使用
         company_folder = company_name or "unknown"

@@ -41,12 +41,7 @@ def load_group_companies_config_from_s3(bucket: str, key: str) -> Dict[str, Any]
         print(f"❌ 設定ファイル読み込み失敗: {e}")
         return {}
 
-def get_company_name_from_group_id(group_id: str, config: Dict[str, Any]) -> str:
-    """グループIDから会社の正式名称を取得"""
-    group_companies = config.get("group_companies", {})
-    if group_id in group_companies:
-        return group_companies[group_id].get("name", group_id)
-    return group_id
+
 
 
 def download_from_s3(s3_path: str) -> str:
@@ -210,14 +205,14 @@ def extract_bracket_content(menu_name: str) -> str:
     return "健康保険適用の施術を相談したい方"
 
 
-def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket: str = None, original_s3_key: str = None, group_id: str = None, company_name: str = None, chart_title: str = "メニュー分類別割合") -> dict:
+def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket: str = None, original_s3_key: str = None, company_name: str = None, chart_title: str = "メニュー分類別割合") -> dict:
     """
     メニュー分類別の円グラフを作成する関数
     Lambda環境用に修正（win32comの代わりにopenpyxlを使用）
     """
     print(f"🎯 グラフ作成開始: {target_path}")
     print(f"🔍 デバッグ: target_pathの型: {type(target_path)}")
-    print(f"🔍 デバッグ: パラメータ - upload_to_s3_flag: {upload_to_s3_flag}, s3_bucket: {s3_bucket}, group_id: {group_id}, company_name: {company_name}")
+    print(f"🔍 デバッグ: パラメータ - upload_to_s3_flag: {upload_to_s3_flag}, s3_bucket: {s3_bucket}, company_name: {company_name}")
     
     # target_pathがPathオブジェクトであることを確認
     if not isinstance(target_path, Path):
@@ -424,18 +419,11 @@ def add_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bucket:
                     from datetime import datetime
                     current_date = datetime.now()
                     year_month = f"{current_date.year}_{current_date.month:02d}"
-                    company_folder = company_name or group_id or "unknown"
+                    company_folder = company_name or "unknown"
                     upload_prefix = f"{year_month}/{company_folder}/"
                     
-                    # グループIDを含むファイル名を生成
-                    if group_id:
-                        # ファイル名にグループIDが含まれていない場合は追加
-                        if not target_path.name.startswith(f"{group_id}_"):
-                            s3_key = f"{upload_prefix}{group_id}_{target_path.name}"
-                        else:
-                            s3_key = f"{upload_prefix}{target_path.name}"
-                    else:
-                        s3_key = f"{upload_prefix}{target_path.name}"
+                    # ファイル名をそのまま使用（グループIDは含めない）
+                    s3_key = f"{upload_prefix}{target_path.name}"
                 print(f"🔍 デバッグ: S3キー: '{s3_key}'")
                 
                 s3_result = upload_to_s3(str(target_path), bucket_name, s3_key)
@@ -601,7 +589,7 @@ def add_site_pivot_pie(target_path: Path, upload_to_s3_flag: bool = False, s3_bu
         }
 
 
-def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3: bool = False, s3_bucket: str = None, group_id: str = None, company_name: str = None) -> dict:
+def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3: bool = False, s3_bucket: str = None, company_name: str = None) -> dict:
     """
     Excelファイルを処理する関数
     """
@@ -631,7 +619,7 @@ def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3:
             }
         
         if process_type == "menu":
-            return add_pivot_pie(target_path, upload_to_s3, s3_bucket, None, group_id, company_name)
+            return add_pivot_pie(target_path, upload_to_s3, s3_bucket, None, company_name)
         elif process_type == "site":
             return add_site_pivot_pie(target_path, upload_to_s3, s3_bucket)
         else:
@@ -648,7 +636,7 @@ def process_excel_file(file_path: str, process_type: str = "menu", upload_to_s3:
 
 
 def _get_target_months_from_data(data: List[Dict]) -> List[Tuple[int, int]]:
-    """直近2か月の対象月を取得する関数（7月と8月）"""
+    """直近1か月の対象月を取得する関数（前月）"""
     try:
         from zoneinfo import ZoneInfo
         JST = ZoneInfo("Asia/Tokyo")
@@ -661,18 +649,10 @@ def _get_target_months_from_data(data: List[Dict]) -> List[Tuple[int, int]]:
     current_year = now.year
     current_month = now.month
     
-    # 直近2か月を計算（7月と8月）
+    # 直近1か月を計算（前月）
     target_months = []
     
-    # 2か月前の月（7月）
-    if current_month <= 2:
-        two_months_ago_year = current_year - 1
-        two_months_ago_month = current_month + 10  # 12 + (month - 2)
-    else:
-        two_months_ago_year = current_year
-        two_months_ago_month = current_month - 2
-    
-    # 前の月（8月）
+    # 前月を計算
     if current_month == 1:
         previous_month_year = current_year - 1
         previous_month = 12
@@ -680,8 +660,7 @@ def _get_target_months_from_data(data: List[Dict]) -> List[Tuple[int, int]]:
         previous_month_year = current_year
         previous_month = current_month - 1
     
-    # 対象月を追加（7月と8月）
-    target_months.append((two_months_ago_year, two_months_ago_month))
+    # 対象月を追加（前月）
     target_months.append((previous_month_year, previous_month))
     
     print(f"🔍 対象月: {target_months}")
@@ -713,11 +692,11 @@ def parse_datetime(date_str: str) -> Optional[datetime]:
     return None
 
 
-def _list_last_two_months_files(s3, bucket: str, prefix: str, process_type: str = "menu") -> List[Dict[str, str]]:
-    """直近2か月分の統合データファイルを検索する関数（複数グループ会社対応）"""
-    print(f"🔍 デバッグ: _list_last_two_months_files開始 - bucket: {bucket}, prefix: {prefix}")
+def _list_last_one_month_files(s3, bucket: str, prefix: str, process_type: str = "menu") -> List[Dict[str, str]]:
+    """直近1か月分の統合データファイルを検索する関数（複数グループ会社対応）"""
+    print(f"🔍 デバッグ: _list_last_one_month_files開始 - bucket: {bucket}, prefix: {prefix}")
     
-    # 直近2か月の対象月を取得（7月と8月）
+    # 直近1か月の対象月を取得（前月）
     target_months = _get_target_months_from_data([])
     print(f"🔍 対象月: {target_months}")
     
@@ -746,22 +725,22 @@ def _list_last_two_months_files(s3, bucket: str, prefix: str, process_type: str 
                 
                 m = pattern.search(name)
                 if m:
-                    group_id = m.group(1)  # グループID（オプション）
+                    company_name = m.group(1)  # 会社名（オプション）
                     month_num = int(m.group(2))
-                    print(f"🔍 デバッグ: パターンマッチ - group_id: {group_id}, month_num: {month_num}")
+                    print(f"🔍 デバッグ: パターンマッチ - company_name: {company_name}, month_num: {month_num}")
                     
-                    # 対象月に含まれるかチェック（7月と8月）
+                    # 対象月に含まれるかチェック（前月）
                     for year, month in target_months:
                         if month_num == month:
                             file_info = {
                                 "bucket": bucket, 
                                 "key": key, 
                                 "name": name,
-                                "group_id": group_id,
+                                "company_name": company_name,
                                 "s3_path": f"s3://{bucket}/{key}"
                             }
                             by_month.setdefault((year, month), []).append(file_info)
-                            print(f"  ✅ 発見: {name} (グループ: {group_id})")
+                            print(f"  ✅ 発見: {name} (会社: {company_name})")
                             break
                 else:
                     print(f"🔍 デバッグ: パターンにマッチしない: {name}")
@@ -774,7 +753,7 @@ def _list_last_two_months_files(s3, bucket: str, prefix: str, process_type: str 
         print(f"❌ デバッグ: エラー詳細: {traceback.format_exc()}")
     
     if not by_month:
-        print("⚠️ 直近2か月の統合データファイルが見つかりませんでした")
+        print("⚠️ 直近1か月の統合データファイルが見つかりませんでした")
         return []
     
     # 対象月の順で結果を返す
@@ -816,7 +795,7 @@ def load_csv_from_s3(bucket: str, key: str) -> Optional[List[Dict]]:
 
 
 def lambda_handler(event, context):
-    """S3上の直近2か月分のExcelファイルを自動検索して処理し、結果をS3に保存"""
+    """S3上の直近1か月分のExcelファイルを自動検索して処理し、結果をS3に保存"""
     try:
         print(f"Lambda関数が呼び出されました。イベント: {json.dumps(event, ensure_ascii=False)}")
         # オプション: 明示的にmain()を呼びたい場合（ローカル処理フロー）
@@ -837,21 +816,13 @@ def lambda_handler(event, context):
         s3_bucket = os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group')
         # バケット名のスペースを除去
         s3_bucket = s3_bucket.strip() if s3_bucket else None
-        # 直近2か月の年月を動的に生成
+        # 直近1か月の年月を動的に生成
         from datetime import datetime
         current_date = datetime.now()
         current_year = current_date.year
         current_month = current_date.month
         
-        # 2か月前の月を計算（7月と8月）
-        if current_month <= 2:
-            two_months_ago_year = current_year - 1
-            two_months_ago_month = current_month + 10  # 12 + (month - 2)
-        else:
-            two_months_ago_year = current_year
-            two_months_ago_month = current_month - 2
-        
-        # 前の月を計算
+        # 前月を計算
         if current_month == 1:
             previous_month_year = current_year - 1
             previous_month = 12
@@ -859,8 +830,7 @@ def lambda_handler(event, context):
             previous_month_year = current_year
             previous_month = current_month - 1
         
-        # 直近2か月のフォルダを検索対象とする（7月と8月）
-        two_months_ago_year_month = f"{two_months_ago_year}_{two_months_ago_month:02d}"
+        # 直近1か月のフォルダを検索対象とする（前月）
         previous_year_month = f"{previous_month_year}_{previous_month:02d}"
         
         s3_prefix = os.environ.get('S3_OUTPUT_PREFIX', f'{current_year}_{current_month:02d}/')
@@ -868,9 +838,6 @@ def lambda_handler(event, context):
         process_type = os.environ.get('PROCESS_TYPE', 'menu')
         chart_title = (event or {}).get("chart_title", "メニュー分類別割合")
         
-        # グループ会社設定を読み込み
-        config_key = "bigquery-data/group_companies_config.json"
-        group_config = load_group_companies_config_from_s3(s3_bucket, config_key)
         
         print(f"🔍 デバッグ: 環境変数 - バケット: '{s3_bucket}', プレフィックス: '{s3_prefix}', アップロードプレフィックス: '{upload_prefix}'")
         
@@ -884,11 +851,11 @@ def lambda_handler(event, context):
         # Step Functions用の入力形式に対応
         input_files = event.get('input_files', event.get('input', event.get('uploaded', [])))
         
-        # 入力ファイルが指定されていない場合は、直近2か月分のファイルを自動検索
+        # 入力ファイルが指定されていない場合は、直近1か月分のファイルを自動検索
         if not input_files:
-            print(f"🔍 直近2か月分のファイルを検索中...")
+            print(f"🔍 直近1か月分のファイルを検索中...")
             print(f"📁 Lambda関数: S3バケット '{s3_bucket}' からファイルを検索中...")
-            target_files = _list_last_two_months_files(s3_client, s3_bucket, s3_prefix, process_type)
+            target_files = _list_last_one_month_files(s3_client, s3_bucket, s3_prefix, process_type)
             
             if not target_files:
                 print("❌ 対象ファイルが見つかりません")
@@ -947,36 +914,23 @@ def lambda_handler(event, context):
         
         print(f"🔍 デバッグ: 処理対象ファイル数: {len(files_to_process)}")
         
-        # グループID別にファイルを分類
-        group_files = {}
+        # 会社名別にファイルを分類
+        company_files = {}
         for file_info in files_to_process:
-            filename = file_info['filename']
-            # ファイル名からグループIDを抽出 (例: aoba_7月_統合データ.xlsx)
-            name_parts = filename.replace('.xlsx', '').split('_')
-            if len(name_parts) >= 2:
-                group_id = name_parts[0]
-                if group_id not in group_files:
-                    group_files[group_id] = []
-                group_files[group_id].append(file_info)
-            else:
-                # グループIDがない場合は"default"として処理
-                if "default" not in group_files:
-                    group_files["default"] = []
-                group_files["default"].append(file_info)
+            company_name = file_info.get('company_name', 'unknown')
+            if company_name not in company_files:
+                company_files[company_name] = []
+            company_files[company_name].append(file_info)
         
-        print(f"📁 グループ別ファイル: {[(group, [f['filename'] for f in files]) for group, files in group_files.items()]}")
+        print(f"📁 会社別ファイル: {[(company, [f['name'] for f in files]) for company, files in company_files.items()]}")
         
-        # 各グループのファイルを処理
+        # 各会社のファイルを処理
         processed_files = []
         uploaded_files = []
         errors = []
         
-        for group_id, files in group_files.items():
-            print(f"\n=== グループ {group_id} の処理 ===")
-            
-            # グループIDから会社の正式名称を取得
-            company_name = get_company_name_from_group_id(group_id, group_config)
-            print(f"🏢 会社名: {company_name}")
+        for company_name, files in company_files.items():
+            print(f"\n=== 会社 {company_name} の処理 ===")
             
             for i, file_info in enumerate(files, 1):
                 try:
@@ -990,7 +944,7 @@ def lambda_handler(event, context):
                     # グラフを追加
                     print(f"🎯 グラフ作成開始: {file_info['filename']}")
                     print(f"🔍 デバッグ: add_pivot_pie呼び出し前 - local_path: {local_path}, 存在: {local_path.exists()}")
-                    result = add_pivot_pie(local_path, False, s3_bucket, file_info['key'], group_id, company_name, chart_title)
+                    result = add_pivot_pie(local_path, False, s3_bucket, file_info['key'], company_name, chart_title)
                     print(f"🔍 デバッグ: add_pivot_pie結果: {result}")
                     
                     if result.get('success'):
@@ -1001,7 +955,7 @@ def lambda_handler(event, context):
                         from datetime import datetime
                         current_date = datetime.now()
                         year_month = f"{current_date.year}_{current_date.month:02d}"
-                        company_folder = company_name or group_id or "unknown"
+                        company_folder = company_name or "unknown"
                         new_prefix = f"{year_month}/{company_folder}/"
                         
                         # ファイル名を新しいパスで保存
@@ -1094,10 +1048,10 @@ def main() -> int:
                     group_files[group_id] = []
                 group_files[group_id].append(file)
             else:
-                # グループIDがない場合は"default"として処理
-                if "default" not in group_files:
-                    group_files["default"] = []
-                group_files["default"].append(file)
+                # グループIDがない場合は"unknown"として処理
+                if "unknown" not in group_files:
+                    group_files["unknown"] = []
+                group_files["unknown"].append(file)
         
         print(f"📁 グループ別ファイル: {[(group, [f.name for f in files]) for group, files in group_files.items()]}")
         
@@ -1121,7 +1075,7 @@ def main() -> int:
                 print(f"🎯 処理開始: {target.name}")
                 
                 try:
-                    result = process_excel_file(str(target), "menu", False, None, group_id, company_name)
+                    result = process_excel_file(str(target), "menu", False, None, company_name)
                     if result.get('success', False):
                         print(f"✅ 処理完了: {target.name}")
                         print(f"   カテゴリ数: {len(result.get('categories', []))}")
