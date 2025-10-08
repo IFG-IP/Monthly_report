@@ -367,10 +367,10 @@ def _list_last_one_month_others(s3, bucket: str, prefix: str) -> List[Dict[str, 
 	print(f"🔍 対象月: {target_months}")
 	
 	# 統合データファイルを検索（グループID対応）
-	pattern = re.compile(r"(?:(\w+)_)?(\d+)月_統合データ\.xlsx$")
+	pattern = re.compile(r"(\d+)月_統合データ\.xlsx$")
 	by_month: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
 	
-	# 現在の月のフォルダ内で検索（2025_09/）
+	# 現在の月のフォルダ内で検索（2025_10/）
 	from datetime import datetime
 	current_date = datetime.now()
 	current_year_month = f"{current_date.year}_{current_date.month:02d}"
@@ -383,8 +383,10 @@ def _list_last_one_month_others(s3, bucket: str, prefix: str) -> List[Dict[str, 
 			name = key.split("/")[-1]
 			m = pattern.search(name)
 			if m:
-				company_name = m.group(1)  # 会社名（オプション）
-				month_num = int(m.group(2))
+				month_num = int(m.group(1))
+				# ファイルパスから会社名を抽出（フォルダ名から）
+				path_parts = key.split('/')
+				company_name = path_parts[-2] if len(path_parts) >= 2 else None
 				
 				# 対象月に含まれるかチェック（前月）
 				for year, month in target_months:
@@ -393,6 +395,7 @@ def _list_last_one_month_others(s3, bucket: str, prefix: str) -> List[Dict[str, 
 							"bucket": bucket, 
 							"key": key, 
 							"name": name,
+							"filename": name,  # filenameも追加
 							"company_name": company_name,
 							"s3_path": f"s3://{bucket}/{key}"
 						}
@@ -463,14 +466,23 @@ def lambda_handler(event, context):
 		# Step Functions用の入力形式に対応
 		input_files = event.get('input_files', event.get('input', event.get('uploaded', [])))
 		
-		# 入力ファイルが指定されていない場合は、5月・6月分の"その他"ファイルを自動検索
+		# デバッグ: 受信したイベントの詳細を表示
+		print(f"🔍 デバッグ: 受信したイベント: {json.dumps(event, ensure_ascii=False, indent=2)}")
+		print(f"🔍 デバッグ: 抽出されたinput_files: {input_files}")
+		
+		# 入力ファイルが指定されていない場合は、前月分の"その他"ファイルを自動検索
 		if not input_files:
 			print("🔍 デバッグ: 入力ファイルが指定されていないため、前月分のファイルを自動検索")
+			print(f"🔍 デバッグ: 検索対象 - バケット: {s3_bucket}, プレフィックス: {s3_prefix}")
 			targets = _list_last_one_month_others(s3, s3_bucket, s3_prefix)
+			print(f"🔍 デバッグ: 検索結果 - 見つかったファイル数: {len(targets) if targets else 0}")
+			if targets:
+				for i, target in enumerate(targets[:5]):  # 最初の5個のみ表示
+					print(f"🔍 デバッグ: ファイル {i+1}: {target['key']}")
 			if not targets:
 				return {
 					"success": False,
-					"error": "対象Excelが見つかりません"
+					"error": f"対象Excelが見つかりません (バケット: {s3_bucket}, プレフィックス: {s3_prefix})"
 				}
 			# 自動検索結果をinput_files形式に変換
 			input_files = [f"s3://{s3_bucket}/{t['key']}" for t in targets]
@@ -505,11 +517,18 @@ def lambda_handler(event, context):
 					print(f"⚠️ 無効なバケット名: {bucket_name}")
 					continue
 				
+				filename = s3_key.split('/')[-1]
+				# S3キーから会社名を抽出（フォルダ名から）
+				path_parts = s3_key.split('/')
+				company_name = path_parts[-2] if len(path_parts) >= 2 else 'unknown'
+				
 				files_to_process.append({
 					's3_path': file_path,
 					'bucket': bucket_name,
 					'key': s3_key,
-					'filename': s3_key.split('/')[-1]
+					'filename': filename,
+					'name': filename,  # nameキーも追加
+					'company_name': company_name  # company_nameも追加
 				})
 
 		if not files_to_process:

@@ -701,10 +701,10 @@ def _list_last_one_month_files(s3, bucket: str, prefix: str, process_type: str =
     print(f"🔍 対象月: {target_months}")
     
     # 統合データファイルを検索（グループID対応）
-    pattern = re.compile(r"(?:(\w+)_)?(\d+)月_統合データ\.xlsx$")
+    pattern = re.compile(r"(\d+)月_統合データ\.xlsx$")
     by_month: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
     
-    # 現在の月のフォルダ内で検索（2025_09/）
+    # 現在の月のフォルダ内で検索（2025_10/）
     from datetime import datetime
     current_date = datetime.now()
     current_year_month = f"{current_date.year}_{current_date.month:02d}"
@@ -725,8 +725,10 @@ def _list_last_one_month_files(s3, bucket: str, prefix: str, process_type: str =
                 
                 m = pattern.search(name)
                 if m:
-                    company_name = m.group(1)  # 会社名（オプション）
-                    month_num = int(m.group(2))
+                    month_num = int(m.group(1))
+                    # ファイルパスから会社名を抽出（フォルダ名から）
+                    path_parts = key.split('/')
+                    company_name = path_parts[-2] if len(path_parts) >= 2 else None
                     print(f"🔍 デバッグ: パターンマッチ - company_name: {company_name}, month_num: {month_num}")
                     
                     # 対象月に含まれるかチェック（前月）
@@ -736,6 +738,7 @@ def _list_last_one_month_files(s3, bucket: str, prefix: str, process_type: str =
                                 "bucket": bucket, 
                                 "key": key, 
                                 "name": name,
+                                "filename": name,  # filenameも追加
                                 "company_name": company_name,
                                 "s3_path": f"s3://{bucket}/{key}"
                             }
@@ -851,15 +854,25 @@ def lambda_handler(event, context):
         # Step Functions用の入力形式に対応
         input_files = event.get('input_files', event.get('input', event.get('uploaded', [])))
         
+        # デバッグ: 受信したイベントの詳細を表示
+        print(f"🔍 デバッグ: 受信したイベント: {json.dumps(event, ensure_ascii=False, indent=2)}")
+        print(f"🔍 デバッグ: 抽出されたinput_files: {input_files}")
+        
         # 入力ファイルが指定されていない場合は、直近1か月分のファイルを自動検索
         if not input_files:
             print(f"🔍 直近1か月分のファイルを検索中...")
             print(f"📁 Lambda関数: S3バケット '{s3_bucket}' からファイルを検索中...")
+            print(f"🔍 デバッグ: 検索対象 - バケット: {s3_bucket}, プレフィックス: {s3_prefix}, 処理タイプ: {process_type}")
             target_files = _list_last_one_month_files(s3_client, s3_bucket, s3_prefix, process_type)
+            
+            print(f"🔍 デバッグ: 検索結果 - 見つかったファイル数: {len(target_files) if target_files else 0}")
+            if target_files:
+                for i, target in enumerate(target_files[:5]):  # 最初の5個のみ表示
+                    print(f"🔍 デバッグ: ファイル {i+1}: {target['key']}")
             
             if not target_files:
                 print("❌ 対象ファイルが見つかりません")
-                return {"statusCode": 404, "body": json.dumps({"success": False, "error": "対象ファイルが見つかりません"}, ensure_ascii=False)}
+                return {"statusCode": 404, "body": json.dumps({"success": False, "error": f"対象ファイルが見つかりません (バケット: {s3_bucket}, プレフィックス: {s3_prefix})"}, ensure_ascii=False)}
             
             print(f"✅ {len(target_files)}個のファイルが見つかりました")
             # 自動検索結果をinput_files形式に変換
@@ -896,13 +909,18 @@ def lambda_handler(event, context):
                     continue
                 
                 filename = s3_key.split('/')[-1]
-                print(f"🔍 デバッグ: ファイル名抽出 - s3_key: {s3_key}, filename: {filename}, 型: {type(filename)}")
+                # S3キーから会社名を抽出（フォルダ名から）
+                path_parts = s3_key.split('/')
+                company_name = path_parts[-2] if len(path_parts) >= 2 else 'unknown'
+                print(f"🔍 デバッグ: ファイル名抽出 - s3_key: {s3_key}, filename: {filename}, company_name: {company_name}, 型: {type(filename)}")
                 
                 file_info = {
                     's3_path': file_path,
                     'bucket': bucket_name,
                     'key': s3_key,
-                    'filename': filename
+                    'filename': filename,
+                    'name': filename,  # nameキーも追加
+                    'company_name': company_name  # company_nameも追加
                 }
                 print(f"🔍 デバッグ: 追加するfile_info: {file_info}")
                 print(f"🔍 デバッグ: file_infoの型: {type(file_info)}")

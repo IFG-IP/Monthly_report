@@ -91,7 +91,7 @@ def lambda_handler(event, context):
     # 設定値（環境変数にしてもOK）
     # ========================
     SENDER = "IT_Solutions_Department@epark.co.jp"     # 送信元（Verified 済み）
-    RECIPIENT = "kenta.murakami@iflag.co.jp"  # 宛先（Verified 済み）
+    RECIPIENT = "osamu.mizoguchi@iflag.co.jp"  # 宛先（Verified 済み）
     
     BUCKET_NAME = "monthly-report-output-group"
     
