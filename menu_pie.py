@@ -1083,8 +1083,8 @@ def main() -> int:
             
             # グループIDから会社の正式名称を取得
             # group_configを読み込み（main関数用）
-            config_key = "bigquery-data/group_companies_config.json"
-            group_config = load_group_companies_config_from_s3(os.environ.get('S3_BUCKET_NAME', 'monthly-report-output-group'), config_key)
+            config_key = "group_companies_config.json"
+            group_config = load_group_companies_config_from_s3(os.environ.get('S3_BUCKET_NAME2', 'monthly-report-group-json'), config_key)
             company_name = get_company_name_from_group_id(group_id, group_config)
             print(f"🏢 会社名: {company_name}")
             
