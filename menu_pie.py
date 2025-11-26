@@ -182,25 +182,15 @@ def extract_bracket_content(menu_name: str) -> str:
     # 文字列を正規化（前後の空白を除去、連続する空白を単一の空白に統一）
     menu_name = re.sub(r'\s+', ' ', menu_name.strip())
     
-    # 括弧のパターンを検索（全角・半角両方対応）
-    patterns = [
-        r'（(.+?)）',  # 全角括弧
-        r'\((.+?)\)',  # 半角括弧
-        r'【(.+?)】',  # 全角角括弧
-        r'\[(.+?)\]',  # 半角角括弧
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, menu_name)
-        if match:
-            content = match.group(1).strip()
-            # 空文字や空白文字のみの場合は「健康保険適用の施術を相談したい方」を返す
-            if content and not content.isspace():
-                return content
-            else:
-                # 空の括弧の場合は「健康保険適用の施術を相談したい方」を返す
-                return "健康保険適用の施術を相談したい方"
-    
+    # 括弧のパターンを検索（全角角括弧【】のみ）
+    pattern = r'【(.+?)】'
+    match = re.search(pattern, menu_name)
+    if match:
+        content = match.group(1).strip()
+        if content and not content.isspace():
+            return content
+        else:
+            return "健康保険適用の施術を相談したい方"
     # 括弧が見つからない場合は「健康保険適用の施術を相談したい方」を返す
     return "健康保険適用の施術を相談したい方"
 
